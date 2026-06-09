@@ -137,6 +137,25 @@ async function getHeadings(page) {
   );
 }
 
+async function getLanguage(page) {
+  return page.evaluate(() => document.documentElement.getAttribute("lang")?.trim() || "");
+}
+
+const analyzers = {
+  headings: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    headings: await getHeadings(page),
+  }),
+  language: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    language: await getLanguage(page),
+  }),
+};
+
 app.use((req, res, next) => {
   setCorsHeaders(req, res);
   next();
@@ -157,7 +176,7 @@ app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
 
-  if (command !== "headings") {
+  if (!analyzers[command]) {
     res.status(400).json({ ok: false, error: "Ukjent analysekommando." });
     return;
   }
@@ -172,14 +191,9 @@ app.get("/analyze", async (req, res) => {
 
   try {
     const url = await validatePublicUrl(requestedUrl);
-    const headings = await analyzePage(url, getHeadings);
+    const result = await analyzePage(url, (page) => analyzers[command](page, url));
 
-    res.json({
-      ok: true,
-      engine: "playwright",
-      url,
-      headings,
-    });
+    res.json(result);
   } catch (error) {
     res.status(500).json({
       ok: false,
