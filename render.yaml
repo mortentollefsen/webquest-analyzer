@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: webquest-analyzer
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: ALLOWED_ORIGINS
+        value: https://mortentollefsen.no,https://www.mortentollefsen.no
