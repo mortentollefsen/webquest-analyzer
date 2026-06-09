@@ -179,6 +179,194 @@ async function getLanguage(page) {
   return page.evaluate(() => document.documentElement.getAttribute("lang")?.trim() || "");
 }
 
+async function getFields(page) {
+  return page.evaluate(() => {
+    const fieldSelector = "input, textarea, select, button";
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isHidden(element) {
+      if (element.tagName.toLowerCase() === "input" && element.type === "hidden") {
+        return true;
+      }
+
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          style.contentVisibility === "hidden"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    function textFromIds(ids) {
+      return ids
+        .split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((element) => normalized(element.innerText || element.textContent))
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    function explicitLabel(element) {
+      if (element.labels && element.labels.length > 0) {
+        return Array.from(element.labels)
+          .map((label) => normalized(label.innerText || label.textContent))
+          .filter(Boolean)
+          .join(" ");
+      }
+
+      if (element.id) {
+        const label = document.querySelector(`label[for="${CSS.escape(element.id)}"]`);
+
+        if (label) {
+          return normalized(label.innerText || label.textContent);
+        }
+      }
+
+      return "";
+    }
+
+    function accessibleName(element) {
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+
+      if (ariaLabel) {
+        return ariaLabel;
+      }
+
+      const labelledBy = normalized(element.getAttribute("aria-labelledby"));
+
+      if (labelledBy) {
+        const label = normalized(textFromIds(labelledBy));
+
+        if (label) {
+          return label;
+        }
+      }
+
+      if (element.tagName.toLowerCase() === "button") {
+        return normalized(element.innerText || element.textContent || element.getAttribute("value"));
+      }
+
+      if (element.type === "button" || element.type === "submit" || element.type === "reset") {
+        return normalized(element.getAttribute("value"));
+      }
+
+      if (element.type === "image") {
+        return normalized(element.getAttribute("alt"));
+      }
+
+      return explicitLabel(element);
+    }
+
+    function fieldType(element) {
+      const tagName = element.tagName.toLowerCase();
+
+      if (tagName === "input") {
+        return element.getAttribute("type") || "text";
+      }
+
+      return tagName;
+    }
+
+    function fieldValue(element) {
+      const tagName = element.tagName.toLowerCase();
+      const type = fieldType(element);
+
+      if (type === "password") {
+        return "(skjult)";
+      }
+
+      if (type === "checkbox" || type === "radio") {
+        const value = element.getAttribute("value") || "";
+        return `${value}${element.checked ? " (valgt)" : " (ikke valgt)"}`;
+      }
+
+      if (tagName === "select") {
+        return Array.from(element.selectedOptions)
+          .map((option) => normalized(option.textContent) || option.value)
+          .join(", ");
+      }
+
+      if (tagName === "button") {
+        return element.getAttribute("value") || "";
+      }
+
+      return element.value || element.getAttribute("value") || "";
+    }
+
+    function fieldInfo(element) {
+      const tagName = element.tagName.toLowerCase();
+      const kind =
+        tagName === "button" ||
+        ["button", "submit", "reset", "image"].includes((element.getAttribute("type") || "").toLowerCase())
+          ? "button"
+          : "field";
+
+      return {
+        kind,
+        type: fieldType(element),
+        value: fieldValue(element),
+        name: accessibleName(element),
+      };
+    }
+
+    function firstLegend(fieldset) {
+      const legend = Array.from(fieldset.children).find(
+        (child) => child.tagName && child.tagName.toLowerCase() === "legend"
+      );
+
+      return legend ? normalized(legend.innerText || legend.textContent) : "";
+    }
+
+    function directFieldsInFieldset(fieldset) {
+      return Array.from(fieldset.querySelectorAll(fieldSelector)).filter(
+        (field) => field.closest("fieldset") === fieldset && !isHidden(field)
+      );
+    }
+
+    const groups = [];
+    const groupedFields = new Set();
+    const fieldsets = Array.from(document.querySelectorAll("fieldset")).filter((fieldset) => !isHidden(fieldset));
+
+    fieldsets.forEach((fieldset) => {
+      const fields = directFieldsInFieldset(fieldset);
+
+      fields.forEach((field) => groupedFields.add(field));
+
+      groups.push({
+        type: "fieldset",
+        legend: firstLegend(fieldset),
+        fields: fields.map(fieldInfo),
+      });
+    });
+
+    const ungroupedFields = Array.from(document.querySelectorAll(fieldSelector)).filter(
+      (field) => !groupedFields.has(field) && !field.closest("fieldset") && !isHidden(field)
+    );
+
+    if (ungroupedFields.length > 0) {
+      groups.unshift({
+        type: "ungrouped",
+        fields: ungroupedFields.map(fieldInfo),
+      });
+    }
+
+    return groups;
+  });
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -191,6 +379,12 @@ const analyzers = {
     engine: "playwright",
     url,
     language: await getLanguage(page),
+  }),
+  fields: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    groups: await getFields(page),
   }),
 };
 
