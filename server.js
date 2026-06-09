@@ -557,6 +557,458 @@ async function getContrast(page) {
   });
 }
 
+async function getLinks(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    function textFromIds(ids) {
+      return ids
+        .split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((element) => normalized(element.innerText || element.textContent))
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    function accessibleName(element) {
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+      const labelledBy = normalized(element.getAttribute("aria-labelledby"));
+
+      if (ariaLabel) {
+        return ariaLabel;
+      }
+
+      if (labelledBy) {
+        return textFromIds(labelledBy);
+      }
+
+      return normalized(element.innerText || element.textContent);
+    }
+
+    const links = Array.from(document.querySelectorAll("a[href]")).map((link) => ({
+      name: accessibleName(link),
+      href: link.href,
+      newWindow: link.target === "_blank",
+      selector: selectorFor(link),
+    }));
+    const issues = [];
+    const byText = new Map();
+    const byHref = new Map();
+
+    links.forEach((link) => {
+      if (!link.name) {
+        issues.push(`Lenke mangler tekst: ${link.href}`);
+      }
+
+      if (link.newWindow && !/nytt|new/i.test(link.name)) {
+        issues.push(`Lenke åpnes i nytt vindu uten at teksten sier det: ${link.name || link.href}`);
+      }
+
+      const textKey = link.name.toLowerCase();
+      const hrefKey = link.href;
+
+      if (textKey) {
+        if (!byText.has(textKey)) {
+          byText.set(textKey, new Set());
+        }
+
+        byText.get(textKey).add(hrefKey);
+      }
+
+      if (!byHref.has(hrefKey)) {
+        byHref.set(hrefKey, new Set());
+      }
+
+      if (textKey) {
+        byHref.get(hrefKey).add(link.name);
+      }
+    });
+
+    byText.forEach((hrefs, text) => {
+      if (hrefs.size > 1) {
+        issues.push(`Samme lenketekst går til ulike URL-er: ${text}`);
+      }
+    });
+
+    byHref.forEach((texts, href) => {
+      if (texts.size > 1) {
+        issues.push(`Samme URL har ulike lenketekster: ${href}`);
+      }
+    });
+
+    return { links, issues };
+  });
+}
+
+async function getImages(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.src || element.currentSrc || element.tagName.toLowerCase();
+    }
+
+    return Array.from(document.querySelectorAll("img")).map((image) => {
+      const hasAlt = image.hasAttribute("alt");
+      const alt = image.getAttribute("alt") || "";
+      let altStatus = "mangler alt";
+
+      if (hasAlt && alt === "") {
+        altStatus = "tom alt";
+      } else if (hasAlt) {
+        altStatus = alt;
+      }
+
+      return {
+        altStatus,
+        src: image.currentSrc || image.src || "",
+        role: normalized(image.getAttribute("role")),
+        ariaHidden: image.getAttribute("aria-hidden") === "true",
+        selector: selectorFor(image),
+      };
+    });
+  });
+}
+
+async function getLandmarks(page) {
+  return page.evaluate(() => {
+    const landmarkRoles = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"]);
+    const selector = "header, nav, main, aside, footer, form, section, [role]";
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    function textFromIds(ids) {
+      return ids
+        .split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((element) => normalized(element.innerText || element.textContent))
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    function accessibleName(element) {
+      return (
+        normalized(element.getAttribute("aria-label")) ||
+        textFromIds(normalized(element.getAttribute("aria-labelledby")))
+      );
+    }
+
+    function roleFor(element) {
+      const explicitRole = normalized(element.getAttribute("role"));
+
+      if (landmarkRoles.has(explicitRole)) {
+        return explicitRole;
+      }
+
+      const tag = element.tagName.toLowerCase();
+
+      if (tag === "header") {
+        return "banner";
+      }
+
+      if (tag === "nav") {
+        return "navigation";
+      }
+
+      if (tag === "main") {
+        return "main";
+      }
+
+      if (tag === "aside") {
+        return "complementary";
+      }
+
+      if (tag === "footer") {
+        return "contentinfo";
+      }
+
+      if (tag === "form" && accessibleName(element)) {
+        return "form";
+      }
+
+      if (tag === "section" && accessibleName(element)) {
+        return "region";
+      }
+
+      return "";
+    }
+
+    const landmarks = Array.from(document.querySelectorAll(selector))
+      .map((element) => ({
+        role: roleFor(element),
+        name: accessibleName(element),
+        selector: selectorFor(element),
+      }))
+      .filter((landmark) => landmark.role);
+    const issues = [];
+    const mains = landmarks.filter((landmark) => landmark.role === "main");
+    const navs = landmarks.filter((landmark) => landmark.role === "navigation");
+
+    if (mains.length === 0) {
+      issues.push("main mangler.");
+    }
+
+    if (mains.length > 1) {
+      issues.push("Det finnes flere main-landemerker.");
+    }
+
+    if (navs.length > 1 && navs.some((nav) => !nav.name)) {
+      issues.push("Flere navigasjonslandemerker finnes, og minst ett mangler navn.");
+    }
+
+    return { landmarks, issues };
+  });
+}
+
+async function getTitleInfo(page) {
+  return page.evaluate(() => {
+    const title = document.title.trim();
+    const firstH1 = document.querySelector("h1")?.innerText.replace(/\s+/g, " ").trim() || "";
+    let message = "OK.";
+
+    if (!title && !firstH1) {
+      message = "Dokumenttittel og h1 mangler.";
+    } else if (!title) {
+      message = "Dokumenttittel mangler.";
+    } else if (!firstH1) {
+      message = "Første h1 mangler.";
+    } else if (!title.toLowerCase().includes(firstH1.toLowerCase()) && !firstH1.toLowerCase().includes(title.toLowerCase())) {
+      message = "Dokumenttittel og første h1 virker ulike.";
+    }
+
+    return { title, firstH1, message };
+  });
+}
+
+async function getFocus(page) {
+  return page.evaluate(() => {
+    const selector = [
+      "a[href]",
+      "button",
+      "input:not([type='hidden'])",
+      "select",
+      "textarea",
+      "[tabindex]",
+      "[contenteditable='true']",
+    ].join(",");
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isHidden(element) {
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    function textFromIds(ids) {
+      return ids
+        .split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((element) => normalized(element.innerText || element.textContent))
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    function accessibleName(element) {
+      return (
+        normalized(element.getAttribute("aria-label")) ||
+        textFromIds(normalized(element.getAttribute("aria-labelledby"))) ||
+        normalized(element.innerText || element.textContent || element.getAttribute("alt") || element.getAttribute("value"))
+      );
+    }
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter((element) => !element.disabled && element.tabIndex >= 0 && !isHidden(element))
+      .sort((a, b) => {
+        const aTab = a.tabIndex === 0 ? Number.MAX_SAFE_INTEGER : a.tabIndex;
+        const bTab = b.tabIndex === 0 ? Number.MAX_SAFE_INTEGER : b.tabIndex;
+        return aTab - bTab;
+      })
+      .map((element) => ({
+        type: element.tagName.toLowerCase(),
+        name: accessibleName(element),
+        text: normalized(element.innerText || element.textContent),
+        tabindex: element.getAttribute("tabindex") || "0",
+        selector: selectorFor(element),
+      }));
+  });
+}
+
+async function getAriaIssues(page) {
+  return page.evaluate(() => {
+    const issues = [];
+    const focusableSelector = "a[href], button, input, select, textarea, [tabindex]";
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function labelFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    document.querySelectorAll("[aria-hidden='true']").forEach((element) => {
+      if (element.matches(focusableSelector) || element.querySelector(focusableSelector)) {
+        issues.push(`aria-hidden brukes på eller rundt fokuserbart innhold: ${labelFor(element)}`);
+      }
+    });
+
+    document.querySelectorAll("[aria-labelledby]").forEach((element) => {
+      const missing = normalized(element.getAttribute("aria-labelledby"))
+        .split(/\s+/)
+        .filter((id) => id && !document.getElementById(id));
+
+      if (missing.length > 0) {
+        issues.push(`aria-labelledby peker til manglende id på ${labelFor(element)}: ${missing.join(", ")}`);
+      }
+    });
+
+    document.querySelectorAll("[aria-label]").forEach((element) => {
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+      const visibleText = normalized(element.innerText || element.textContent);
+
+      if (ariaLabel && visibleText && ariaLabel !== visibleText) {
+        issues.push(`aria-label er ulik synlig tekst på ${labelFor(element)}. Synlig tekst: ${visibleText}. Aria-label: ${ariaLabel}.`);
+      }
+    });
+
+    document.querySelectorAll("[role]").forEach((element) => {
+      const role = normalized(element.getAttribute("role"));
+
+      if (["button", "link", "checkbox", "radio"].includes(role) && !normalized(element.innerText || element.textContent || element.getAttribute("aria-label"))) {
+        issues.push(`Element med role="${role}" mangler tilgjengelig navn: ${labelFor(element)}`);
+      }
+    });
+
+    return issues;
+  });
+}
+
+async function getTables(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return "table";
+    }
+
+    return Array.from(document.querySelectorAll("table")).map((table) => {
+      const rows = table.rows.length;
+      const columns = rows > 0 ? Math.max(...Array.from(table.rows).map((row) => row.cells.length)) : 0;
+      const headers = Array.from(table.querySelectorAll("th"));
+      const caption = normalized(table.caption?.innerText || table.caption?.textContent || "");
+
+      return {
+        caption,
+        rows,
+        columns,
+        headerCells: headers.length,
+        missingScope: headers.some((header) => !header.hasAttribute("scope")),
+        possibleLayout: headers.length === 0 && !caption,
+        selector: selectorFor(table),
+      };
+    });
+  });
+}
+
+async function getIframes(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return "iframe";
+    }
+
+    return Array.from(document.querySelectorAll("iframe")).map((iframe) => ({
+      title: normalized(iframe.getAttribute("title")),
+      src: iframe.src || iframe.getAttribute("src") || "",
+      selector: selectorFor(iframe),
+    }));
+  });
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -581,6 +1033,62 @@ const analyzers = {
     engine: "playwright",
     url,
     contrast: await getContrast(page),
+  }),
+  links: async (page, url) => {
+    const result = await getLinks(page);
+
+    return {
+      ok: true,
+      engine: "playwright",
+      url,
+      ...result,
+    };
+  },
+  images: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    images: await getImages(page),
+  }),
+  landmarks: async (page, url) => {
+    const result = await getLandmarks(page);
+
+    return {
+      ok: true,
+      engine: "playwright",
+      url,
+      ...result,
+    };
+  },
+  title: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    titleInfo: await getTitleInfo(page),
+  }),
+  focus: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    focus: await getFocus(page),
+  }),
+  aria: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    issues: await getAriaIssues(page),
+  }),
+  tables: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    tables: await getTables(page),
+  }),
+  iframes: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    iframes: await getIframes(page),
   }),
 };
 
