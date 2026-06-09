@@ -126,14 +126,52 @@ async function analyzePage(url, analyzer) {
 
 async function getHeadings(page) {
   return page.locator("h1, h2, h3, h4, h5, h6").evaluateAll((headings) =>
-    headings.map((heading) => ({
-      level: Number(heading.tagName.slice(1)),
-      text:
-        heading.getAttribute("aria-label") ||
-        heading.innerText.replace(/\s+/g, " ").trim() ||
-        heading.textContent.replace(/\s+/g, " ").trim() ||
-        "(tom overskrift)",
-    }))
+    headings
+      .map((heading) => {
+        function hasHiddenAncestor(element) {
+          for (let node = element; node; node = node.parentElement) {
+            const style = window.getComputedStyle(node);
+
+            if (
+              node.hasAttribute("hidden") ||
+              node.getAttribute("type") === "hidden" ||
+              style.display === "none" ||
+              style.visibility === "hidden" ||
+              style.visibility === "collapse" ||
+              style.contentVisibility === "hidden"
+            ) {
+              return true;
+            }
+          }
+
+          return false;
+        }
+
+        function hasAriaHiddenAncestor(element) {
+          for (let node = element; node; node = node.parentElement) {
+            if (node.getAttribute("aria-hidden") === "true") {
+              return true;
+            }
+          }
+
+          return false;
+        }
+
+        if (hasHiddenAncestor(heading)) {
+          return null;
+        }
+
+        return {
+          level: Number(heading.tagName.slice(1)),
+          text:
+            heading.getAttribute("aria-label") ||
+            heading.innerText.replace(/\s+/g, " ").trim() ||
+            heading.textContent.replace(/\s+/g, " ").trim() ||
+            "(tom overskrift)",
+          ariaHidden: hasAriaHiddenAncestor(heading),
+        };
+      })
+      .filter(Boolean)
   );
 }
 
