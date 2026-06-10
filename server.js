@@ -124,6 +124,133 @@ async function analyzePage(url, analyzer) {
   }
 }
 
+function extractResponseText(data) {
+  if (typeof data.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
+
+  return (data.output || [])
+    .flatMap((item) => item.content || [])
+    .filter((content) => content.type === "output_text" && content.text)
+    .map((content) => content.text)
+    .join("\n")
+    .trim();
+}
+
+async function renderImageAsDataUrl(imageUrl) {
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    viewport: { width: 1400, height: 1000 },
+    locale: "nb-NO",
+    userAgent:
+      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+  });
+  const page = await context.newPage();
+
+  try {
+    await page.setContent(
+      `<!doctype html>
+      <html lang="no">
+        <head>
+          <meta charset="utf-8">
+          <style>
+            html, body { margin: 0; padding: 24px; background: #fff; }
+            img { display: block; max-width: 1200px; max-height: 900px; width: auto; height: auto; }
+          </style>
+        </head>
+        <body>
+          <img id="webquest-image" alt="" src="${imageUrl.replace(/"/g, "&quot;")}">
+        </body>
+      </html>`,
+      { waitUntil: "domcontentloaded" }
+    );
+
+    await page.evaluate(() =>
+      new Promise((resolve, reject) => {
+        const image = document.getElementById("webquest-image");
+
+        if (!image) {
+          reject(new Error("Fant ikke bildet."));
+          return;
+        }
+
+        if (image.complete && image.naturalWidth > 0) {
+          resolve();
+          return;
+        }
+
+        image.addEventListener("load", () => resolve(), { once: true });
+        image.addEventListener("error", () => reject(new Error("Bildet kunne ikke lastes.")), { once: true });
+        window.setTimeout(() => reject(new Error("Bildet brukte for lang tid på å laste.")), 15000);
+      })
+    );
+
+    const image = page.locator("#webquest-image");
+    const buffer = await image.screenshot({ type: "png" });
+    return `data:image/png;base64,${buffer.toString("base64")}`;
+  } finally {
+    await context.close();
+  }
+}
+
+async function describeImage(url) {
+  const apiKey = process.env.OPENAI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY mangler på serveren.");
+  }
+
+  const imageDataUrl = await renderImageAsDataUrl(url);
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: process.env.OPENAI_VISION_MODEL || "gpt-4.1-mini",
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text:
+                "Beskriv selve bildet på norsk. Ikke vurder om bildet trenger alt-tekst. " +
+                "Beskriv motiv, synlig tekst, layout, farger, stil og bakgrunn. " +
+                "Hvis bildet er en logo eller et ikon, beskriv formen og teksten konkret.",
+            },
+            {
+              type: "input_image",
+              image_url: imageDataUrl,
+              detail: "high",
+            },
+          ],
+        },
+      ],
+      max_output_tokens: 500,
+    }),
+  });
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.error?.message || "Bildet kunne ikke beskrives.");
+  }
+
+  const description = extractResponseText(data);
+
+  if (!description) {
+    throw new Error("Bildet ble analysert, men svaret manglet beskrivelse.");
+  }
+
+  return {
+    ok: true,
+    engine: "openai",
+    url,
+    description,
+  };
+}
+
 async function getHeadings(page) {
   return page.locator("h1, h2, h3, h4, h5, h6").evaluateAll((headings) =>
     headings
@@ -1653,6 +1780,30 @@ app.get("/health", (req, res) => {
 app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
+
+  if (command === "describe") {
+    if (!requestedUrl) {
+      res.status(400).json({
+        ok: false,
+        error: "Du må angi en bilde-URL etter Beskriv.",
+      });
+      return;
+    }
+
+    try {
+      const url = await validatePublicUrl(requestedUrl);
+      const result = await describeImage(url);
+
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error.message || "Jeg fikk ikke beskrevet bildet.",
+      });
+    }
+
+    return;
+  }
 
   if (!analyzers[command]) {
     res.status(400).json({ ok: false, error: "Ukjent analysekommando." });
