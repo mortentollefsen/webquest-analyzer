@@ -1783,6 +1783,44 @@ async function getIframes(page) {
   });
 }
 
+async function getIds(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    const counts = new Map();
+    const ids = Array.from(document.querySelectorAll("[id]")).map((element) => {
+      const id = element.id;
+      counts.set(id, (counts.get(id) || 0) + 1);
+
+      return {
+        id,
+        element: element.tagName.toLowerCase(),
+        text: normalized(element.innerText || element.textContent).slice(0, 80),
+        selector: selectorFor(element),
+      };
+    });
+    const duplicates = Array.from(counts.entries())
+      .filter(([, count]) => count > 1)
+      .map(([id, count]) => ({ id, count }));
+
+    return {
+      ids,
+      duplicates,
+      issues: duplicates.map((duplicate) => `ID-en "${duplicate.id}" finnes ${duplicate.count} ganger.`),
+    };
+  });
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -1864,6 +1902,16 @@ const analyzers = {
     url,
     iframes: await getIframes(page),
   }),
+  ids: async (page, url) => {
+    const result = await getIds(page);
+
+    return {
+      ok: true,
+      engine: "playwright",
+      url,
+      ...result,
+    };
+  },
 };
 
 app.use((req, res, next) => {
