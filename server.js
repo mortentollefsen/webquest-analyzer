@@ -885,6 +885,24 @@ function collectAccessibilityData(mode) {
   if (mode === "aria") {
     const issues = [];
     const focusableSelector = "a[href], button, input, select, textarea, [tabindex]";
+    const ariaItems = Array.from(document.querySelectorAll("*"))
+      .map((element) => {
+        const attributes = Array.from(element.attributes || [])
+          .filter((attribute) => attribute.name.startsWith("aria-") || attribute.name === "role")
+          .map((attribute) => `${attribute.name}="${attribute.value}"`);
+
+        if (!attributes.length) {
+          return null;
+        }
+
+        return {
+          element: element.tagName.toLowerCase(),
+          selector: selectorFor(element),
+          attributes,
+          text: normalized(element.innerText || element.textContent).slice(0, 80),
+        };
+      })
+      .filter(Boolean);
 
     document.querySelectorAll("[aria-hidden='true']").forEach((element) => {
       if (element.matches(focusableSelector) || element.querySelector(focusableSelector)) {
@@ -905,9 +923,30 @@ function collectAccessibilityData(mode) {
     document.querySelectorAll("[aria-label]").forEach((element) => {
       const ariaLabel = normalized(element.getAttribute("aria-label"));
       const visibleText = normalized(element.innerText || element.textContent);
+      const role = normalized(element.getAttribute("role")).toLowerCase();
+      const tag = element.tagName.toLowerCase();
+      const labelInNameRoles = new Set([
+        "button",
+        "link",
+        "checkbox",
+        "radio",
+        "switch",
+        "tab",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "treeitem",
+      ]);
+      const labelInNameElements = new Set(["a", "button"]);
+      const type = (element.getAttribute("type") || "").toLowerCase();
+      const isLabelInNameRelevant =
+        labelInNameRoles.has(role) ||
+        labelInNameElements.has(tag) ||
+        (tag === "input" && ["button", "submit", "reset", "checkbox", "radio"].includes(type));
 
-      if (ariaLabel && visibleText && ariaLabel !== visibleText) {
-        issues.push(`aria-label er ulik synlig tekst på ${selectorFor(element)}. Synlig tekst: ${visibleText}. Aria-label: ${ariaLabel}.`);
+      if (isLabelInNameRelevant && ariaLabel && visibleText && !ariaLabel.toLowerCase().includes(visibleText.toLowerCase())) {
+        issues.push(`aria-label inneholder ikke synlig tekst på ${selectorFor(element)}. Synlig tekst: ${visibleText}. Aria-label: ${ariaLabel}.`);
       }
     });
 
@@ -919,7 +958,7 @@ function collectAccessibilityData(mode) {
       }
     });
 
-    return issues;
+    return { ariaItems, issues };
   }
 
   if (mode === "iframes") {
@@ -2060,12 +2099,16 @@ const analyzers = {
     url,
     focus: await getFocus(page),
   }),
-  aria: async (page, url) => ({
-    ok: true,
-    engine: "playwright",
-    url,
-    issues: await getAriaIssues(page),
-  }),
+  aria: async (page, url) => {
+    const result = await getAriaIssues(page);
+
+    return {
+      ok: true,
+      engine: "playwright",
+      url,
+      ...result,
+    };
+  },
   tables: async (page, url) => ({
     ok: true,
     engine: "playwright",
