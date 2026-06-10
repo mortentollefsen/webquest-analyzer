@@ -179,7 +179,528 @@ async function getLanguage(page) {
   return page.evaluate(() => document.documentElement.getAttribute("lang")?.trim() || "");
 }
 
+function collectAccessibilityData(mode) {
+  function normalized(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isHidden(element, options = {}) {
+    if (!element || !(element instanceof Element) || options.allowHidden) {
+      return false;
+    }
+
+    if (element.tagName.toLowerCase() === "input" && element.type === "hidden") {
+      return true;
+    }
+
+    for (let node = element; node; node = node.parentElement) {
+      const style = window.getComputedStyle(node);
+
+      if (
+        node.hasAttribute("hidden") ||
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        style.visibility === "collapse" ||
+        style.contentVisibility === "hidden"
+      ) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  function selectorFor(element) {
+    if (element.id) {
+      return `#${CSS.escape(element.id)}`;
+    }
+
+    const parts = [];
+
+    for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+      const tag = node.tagName.toLowerCase();
+      const parent = node.parentElement;
+
+      if (!parent) {
+        parts.unshift(tag);
+        break;
+      }
+
+      const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+      const index = sameTag.indexOf(node) + 1;
+      parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+    }
+
+    return parts.join(" > ");
+  }
+
+  function textFromSubtree(node, options = {}) {
+    if (!node) {
+      return "";
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      return normalized(node.textContent);
+    }
+
+    if (!(node instanceof Element) || isHidden(node, options) || node.getAttribute("aria-hidden") === "true") {
+      return "";
+    }
+
+    const name = accessibleName(node, { ...options, fromContent: true });
+
+    if (name.value) {
+      return name.value;
+    }
+
+    return normalized(Array.from(node.childNodes).map((child) => textFromSubtree(child, options)).join(" "));
+  }
+
+  function labelText(element) {
+    const labels = element.labels ? Array.from(element.labels) : [];
+
+    if (!labels.length && element.id) {
+      labels.push(...document.querySelectorAll(`label[for="${CSS.escape(element.id)}"]`));
+    }
+
+    return normalized(labels.map((label) => textFromSubtree(label, { allowHidden: true })).join(" "));
+  }
+
+  function svgTitle(element) {
+    const title = Array.from(element.children).find((child) => child.tagName.toLowerCase() === "title");
+    return title ? normalized(title.textContent) : "";
+  }
+
+  function nativeName(element) {
+    const tag = element.tagName.toLowerCase();
+    const type = (element.getAttribute("type") || "").toLowerCase();
+
+    if (["img", "area"].includes(tag) || (tag === "input" && type === "image")) {
+      if (element.hasAttribute("alt")) {
+        return { value: normalized(element.getAttribute("alt")), source: "alt" };
+      }
+    }
+
+    if (["input", "select", "textarea", "output", "meter", "progress"].includes(tag)) {
+      const text = labelText(element);
+
+      if (text) {
+        return { value: text, source: "label" };
+      }
+    }
+
+    if (tag === "input" && ["button", "submit", "reset"].includes(type)) {
+      const value = normalized(element.getAttribute("value"));
+
+      if (value) {
+        return { value, source: "value" };
+      }
+    }
+
+    if (tag === "svg") {
+      const title = svgTitle(element);
+
+      if (title) {
+        return { value: title, source: "svg title" };
+      }
+    }
+
+    if (tag === "iframe" && element.hasAttribute("title")) {
+      return { value: normalized(element.getAttribute("title")), source: "title" };
+    }
+
+    return null;
+  }
+
+  function canNameFromContent(element) {
+    const tag = element.tagName.toLowerCase();
+    const role = normalized(element.getAttribute("role")).toLowerCase();
+
+    return ["a", "button", "summary", "option", "legend", "label"].includes(tag) ||
+      ["button", "link", "menuitem", "option", "tab", "treeitem"].includes(role);
+  }
+
+  function accessibleName(element, options = {}) {
+    if (!(element instanceof Element) || isHidden(element, options)) {
+      return { value: "", source: "ingen" };
+    }
+
+    const labelledBy = normalized(element.getAttribute("aria-labelledby"));
+
+    if (!options.fromLabelledBy && labelledBy) {
+      const value = normalized(labelledBy
+        .split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((reference) => accessibleName(reference, { allowHidden: true, fromLabelledBy: true }).value ||
+          textFromSubtree(reference, { allowHidden: true }))
+        .join(" "));
+
+      if (value) {
+        return { value, source: "aria-labelledby" };
+      }
+    }
+
+    const ariaLabel = normalized(element.getAttribute("aria-label"));
+
+    if (!options.fromContent && ariaLabel) {
+      return { value: ariaLabel, source: "aria-label" };
+    }
+
+    const native = nativeName(element);
+
+    if (native) {
+      return native;
+    }
+
+    if (options.fromContent || canNameFromContent(element)) {
+      const value = normalized(Array.from(element.childNodes).map((child) => textFromSubtree(child, options)).join(" "));
+
+      if (value) {
+        return { value, source: "innhold" };
+      }
+    }
+
+    const title = normalized(element.getAttribute("title"));
+
+    if (title) {
+      return { value: title, source: "title" };
+    }
+
+    return { value: "", source: "ingen" };
+  }
+
+  function fieldType(element) {
+    const tagName = element.tagName.toLowerCase();
+
+    if (tagName === "input") {
+      return element.getAttribute("type") || "text";
+    }
+
+    return tagName;
+  }
+
+  function fieldValue(element) {
+    const tagName = element.tagName.toLowerCase();
+    const type = fieldType(element);
+
+    if (type === "password") {
+      return "(skjult)";
+    }
+
+    if (type === "checkbox" || type === "radio") {
+      const value = element.getAttribute("value") || "";
+      return `${value}${element.checked ? " (valgt)" : " (ikke valgt)"}`;
+    }
+
+    if (tagName === "select") {
+      return Array.from(element.selectedOptions)
+        .map((option) => normalized(option.textContent) || option.value)
+        .join(", ");
+    }
+
+    if (tagName === "button") {
+      return element.getAttribute("value") || "";
+    }
+
+    return element.value || element.getAttribute("value") || "";
+  }
+
+  function fieldInfo(element) {
+    const tagName = element.tagName.toLowerCase();
+    const kind =
+      tagName === "button" ||
+      ["button", "submit", "reset", "image"].includes((element.getAttribute("type") || "").toLowerCase())
+        ? "button"
+        : "field";
+    const name = accessibleName(element);
+
+    return {
+      kind,
+      type: fieldType(element),
+      value: fieldValue(element),
+      name: name.value,
+      nameSource: name.source,
+    };
+  }
+
+  function firstLegend(fieldset) {
+    const legend = Array.from(fieldset.children).find(
+      (child) => child.tagName && child.tagName.toLowerCase() === "legend"
+    );
+
+    return legend ? normalized(legend.innerText || legend.textContent) : "";
+  }
+
+  if (mode === "fields") {
+    const fieldSelector = "input, textarea, select, button";
+    const groups = [];
+    const groupedFields = new Set();
+    const fieldsets = Array.from(document.querySelectorAll("fieldset")).filter((fieldset) => !isHidden(fieldset));
+
+    fieldsets.forEach((fieldset) => {
+      const fields = Array.from(fieldset.querySelectorAll(fieldSelector)).filter(
+        (field) => field.closest("fieldset") === fieldset && !isHidden(field)
+      );
+
+      fields.forEach((field) => groupedFields.add(field));
+
+      groups.push({
+        type: "fieldset",
+        legend: firstLegend(fieldset),
+        fields: fields.map(fieldInfo),
+      });
+    });
+
+    const ungroupedFields = Array.from(document.querySelectorAll(fieldSelector)).filter(
+      (field) => !groupedFields.has(field) && !field.closest("fieldset") && !isHidden(field)
+    );
+
+    if (ungroupedFields.length > 0) {
+      groups.unshift({
+        type: "ungrouped",
+        fields: ungroupedFields.map(fieldInfo),
+      });
+    }
+
+    return groups;
+  }
+
+  if (mode === "links") {
+    const links = Array.from(document.querySelectorAll("a[href]")).map((link) => {
+      const name = accessibleName(link);
+
+      return {
+        name: name.value,
+        nameSource: name.source,
+        href: link.href,
+        newWindow: link.target === "_blank",
+        selector: selectorFor(link),
+      };
+    });
+    const issues = [];
+    const byText = new Map();
+    const byHref = new Map();
+
+    links.forEach((link) => {
+      if (!link.name) {
+        issues.push(`Lenke mangler tekst: ${link.href}`);
+      }
+
+      if (link.newWindow && !/nytt|new/i.test(link.name)) {
+        issues.push(`Lenke åpnes i nytt vindu uten at teksten sier det: ${link.name || link.href}`);
+      }
+
+      const textKey = link.name.toLowerCase();
+      const hrefKey = link.href;
+
+      if (textKey) {
+        if (!byText.has(textKey)) {
+          byText.set(textKey, new Set());
+        }
+
+        byText.get(textKey).add(hrefKey);
+      }
+
+      if (!byHref.has(hrefKey)) {
+        byHref.set(hrefKey, new Set());
+      }
+
+      if (textKey) {
+        byHref.get(hrefKey).add(link.name);
+      }
+    });
+
+    byText.forEach((hrefs, text) => {
+      if (hrefs.size > 1) {
+        issues.push(`Samme lenketekst går til ulike URL-er: ${text}`);
+      }
+    });
+
+    byHref.forEach((texts, href) => {
+      if (texts.size > 1) {
+        issues.push(`Samme URL har ulike lenketekster: ${href}`);
+      }
+    });
+
+    return { links, issues };
+  }
+
+  if (mode === "images") {
+    return Array.from(document.querySelectorAll("img, svg, input[type='image'], area")).map((image) => {
+      const tagName = image.tagName.toLowerCase();
+      const name = accessibleName(image);
+      const hasAlt = image.hasAttribute("alt");
+      const alt = image.getAttribute("alt") || "";
+      let altStatus = "mangler alt";
+
+      if (hasAlt && alt === "") {
+        altStatus = "tom alt";
+      } else if (hasAlt) {
+        altStatus = alt;
+      } else if (tagName === "svg") {
+        altStatus = svgTitle(image) ? "svg title" : "mangler tekstalternativ";
+      }
+
+      return {
+        altStatus,
+        name: name.value,
+        nameSource: name.source,
+        src: image.currentSrc || image.src || image.href || image.getAttribute("href") || "",
+        role: normalized(image.getAttribute("role")),
+        ariaHidden: image.getAttribute("aria-hidden") === "true",
+        selector: selectorFor(image),
+      };
+    });
+  }
+
+  if (mode === "landmarks") {
+    const landmarkRoles = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"]);
+    const selector = "header, nav, main, aside, footer, form, section, [role]";
+
+    function roleFor(element) {
+      const explicitRole = normalized(element.getAttribute("role"));
+
+      if (landmarkRoles.has(explicitRole)) {
+        return explicitRole;
+      }
+
+      const tag = element.tagName.toLowerCase();
+
+      if (tag === "header") return "banner";
+      if (tag === "nav") return "navigation";
+      if (tag === "main") return "main";
+      if (tag === "aside") return "complementary";
+      if (tag === "footer") return "contentinfo";
+      if (tag === "form" && accessibleName(element).value) return "form";
+      if (tag === "section" && accessibleName(element).value) return "region";
+
+      return "";
+    }
+
+    const landmarks = Array.from(document.querySelectorAll(selector))
+      .map((element) => {
+        const name = accessibleName(element);
+
+        return {
+          role: roleFor(element),
+          name: name.value,
+          nameSource: name.source,
+          selector: selectorFor(element),
+        };
+      })
+      .filter((landmark) => landmark.role);
+    const issues = [];
+    const mains = landmarks.filter((landmark) => landmark.role === "main");
+    const navs = landmarks.filter((landmark) => landmark.role === "navigation");
+
+    if (mains.length === 0) {
+      issues.push("main mangler.");
+    }
+
+    if (mains.length > 1) {
+      issues.push("Det finnes flere main-landemerker.");
+    }
+
+    if (navs.length > 1 && navs.some((nav) => !nav.name)) {
+      issues.push("Flere navigasjonslandemerker finnes, og minst ett mangler navn.");
+    }
+
+    return { landmarks, issues };
+  }
+
+  if (mode === "focus") {
+    const selector = [
+      "a[href]",
+      "button",
+      "input:not([type='hidden'])",
+      "select",
+      "textarea",
+      "[tabindex]",
+      "[contenteditable='true']",
+    ].join(",");
+
+    return Array.from(document.querySelectorAll(selector))
+      .filter((element) => !element.disabled && element.tabIndex >= 0 && !isHidden(element))
+      .sort((a, b) => {
+        const aTab = a.tabIndex === 0 ? Number.MAX_SAFE_INTEGER : a.tabIndex;
+        const bTab = b.tabIndex === 0 ? Number.MAX_SAFE_INTEGER : b.tabIndex;
+        return aTab - bTab;
+      })
+      .map((element) => {
+        const name = accessibleName(element);
+
+        return {
+          type: element.tagName.toLowerCase(),
+          name: name.value,
+          nameSource: name.source,
+          text: normalized(element.innerText || element.textContent),
+          tabindex: element.getAttribute("tabindex") || "0",
+          selector: selectorFor(element),
+        };
+      });
+  }
+
+  if (mode === "aria") {
+    const issues = [];
+    const focusableSelector = "a[href], button, input, select, textarea, [tabindex]";
+
+    document.querySelectorAll("[aria-hidden='true']").forEach((element) => {
+      if (element.matches(focusableSelector) || element.querySelector(focusableSelector)) {
+        issues.push(`aria-hidden brukes på eller rundt fokuserbart innhold: ${selectorFor(element)}`);
+      }
+    });
+
+    document.querySelectorAll("[aria-labelledby]").forEach((element) => {
+      const missing = normalized(element.getAttribute("aria-labelledby"))
+        .split(/\s+/)
+        .filter((id) => id && !document.getElementById(id));
+
+      if (missing.length > 0) {
+        issues.push(`aria-labelledby peker til manglende id på ${selectorFor(element)}: ${missing.join(", ")}`);
+      }
+    });
+
+    document.querySelectorAll("[aria-label]").forEach((element) => {
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+      const visibleText = normalized(element.innerText || element.textContent);
+
+      if (ariaLabel && visibleText && ariaLabel !== visibleText) {
+        issues.push(`aria-label er ulik synlig tekst på ${selectorFor(element)}. Synlig tekst: ${visibleText}. Aria-label: ${ariaLabel}.`);
+      }
+    });
+
+    document.querySelectorAll("[role]").forEach((element) => {
+      const role = normalized(element.getAttribute("role"));
+
+      if (["button", "link", "checkbox", "radio"].includes(role) && !accessibleName(element).value) {
+        issues.push(`Element med role="${role}" mangler tilgjengelig navn: ${selectorFor(element)}`);
+      }
+    });
+
+    return issues;
+  }
+
+  if (mode === "iframes") {
+    return Array.from(document.querySelectorAll("iframe")).map((iframe) => {
+      const name = accessibleName(iframe);
+
+      return {
+        title: normalized(iframe.getAttribute("title")),
+        name: name.value,
+        nameSource: name.source,
+        src: iframe.src || iframe.getAttribute("src") || "",
+        selector: selectorFor(iframe),
+      };
+    });
+  }
+
+  return null;
+}
+
 async function getFields(page) {
+  return page.evaluate(collectAccessibilityData, "fields");
+
   return page.evaluate(() => {
     const fieldSelector = "input, textarea, select, button";
 
@@ -558,6 +1079,8 @@ async function getContrast(page) {
 }
 
 async function getLinks(page) {
+  return page.evaluate(collectAccessibilityData, "links");
+
   return page.evaluate(() => {
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
@@ -668,6 +1191,8 @@ async function getLinks(page) {
 }
 
 async function getImages(page) {
+  return page.evaluate(collectAccessibilityData, "images");
+
   return page.evaluate(() => {
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
@@ -704,6 +1229,8 @@ async function getImages(page) {
 }
 
 async function getLandmarks(page) {
+  return page.evaluate(collectAccessibilityData, "landmarks");
+
   return page.evaluate(() => {
     const landmarkRoles = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"]);
     const selector = "header, nav, main, aside, footer, form, section, [role]";
@@ -825,6 +1352,8 @@ async function getTitleInfo(page) {
 }
 
 async function getFocus(page) {
+  return page.evaluate(collectAccessibilityData, "focus");
+
   return page.evaluate(() => {
     const selector = [
       "a[href]",
@@ -901,6 +1430,8 @@ async function getFocus(page) {
 }
 
 async function getAriaIssues(page) {
+  return page.evaluate(collectAccessibilityData, "aria");
+
   return page.evaluate(() => {
     const issues = [];
     const focusableSelector = "a[href], button, input, select, textarea, [tabindex]";
@@ -988,6 +1519,8 @@ async function getTables(page) {
 }
 
 async function getIframes(page) {
+  return page.evaluate(collectAccessibilityData, "iframes");
+
   return page.evaluate(() => {
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
