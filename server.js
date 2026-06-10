@@ -693,6 +693,29 @@ function collectAccessibilityData(mode) {
   if (mode === "landmarks") {
     const landmarkRoles = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"]);
     const selector = "header, nav, main, aside, footer, form, section, [role]";
+    const landmarkSelector = "header, nav, main, aside, footer, form[aria-label], form[aria-labelledby], form[role='form'], section[aria-label], section[aria-labelledby], [role='banner'], [role='navigation'], [role='main'], [role='complementary'], [role='contentinfo'], [role='search'], [role='form'], [role='region']";
+    const contentSelector = [
+      "a[href]",
+      "button",
+      "input:not([type='hidden'])",
+      "select",
+      "textarea",
+      "summary",
+      "details",
+      "h1",
+      "h2",
+      "h3",
+      "h4",
+      "h5",
+      "h6",
+      "p",
+      "li",
+      "table",
+      "blockquote",
+      "figure",
+      "[tabindex]",
+      "[contenteditable='true']",
+    ].join(",");
 
     function roleFor(element) {
       const explicitRole = normalized(element.getAttribute("role"));
@@ -712,6 +735,82 @@ function collectAccessibilityData(mode) {
       if (tag === "section" && accessibleName(element).value) return "region";
 
       return "";
+    }
+
+    function isHiddenForLandmarkCheck(element) {
+      if (!(element instanceof Element)) {
+        return true;
+      }
+
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          node.getAttribute("aria-hidden") === "true" ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          style.contentVisibility === "hidden"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    function isFocusable(element) {
+      return !element.disabled && element.tabIndex >= 0 && element.matches(
+        "a[href], button, input, select, textarea, summary, [tabindex], [contenteditable='true']"
+      );
+    }
+
+    function contentLabel(element) {
+      const tag = element.tagName.toLowerCase();
+      const name = accessibleName(element).value;
+      const text = normalized(element.innerText || element.textContent);
+      const value = name || text;
+
+      if (!value) {
+        return tag;
+      }
+
+      return `${tag}: ${value.slice(0, 100)}`;
+    }
+
+    function outsideLandmarkItems() {
+      const items = [];
+      const seenContainers = new Set();
+
+      Array.from(document.querySelectorAll(contentSelector)).forEach((element) => {
+        if (isHiddenForLandmarkCheck(element) || element.closest(landmarkSelector)) {
+          return;
+        }
+
+        const text = normalized(element.innerText || element.textContent);
+
+        if (!text && !isFocusable(element) && !["table", "figure"].includes(element.tagName.toLowerCase())) {
+          return;
+        }
+
+        const container = element.closest("body > *, #root > *, #__next > *") || element;
+        const keyElement = isFocusable(element) ? element : container;
+
+        if (!isFocusable(element) && seenContainers.has(keyElement)) {
+          return;
+        }
+
+        seenContainers.add(keyElement);
+        items.push({
+          type: element.tagName.toLowerCase(),
+          label: contentLabel(element),
+          focusable: isFocusable(element),
+          selector: selectorFor(element),
+        });
+      });
+
+      return items.slice(0, 25);
     }
 
     const landmarks = Array.from(document.querySelectorAll(selector))
@@ -742,7 +841,13 @@ function collectAccessibilityData(mode) {
       issues.push("Flere navigasjonslandemerker finnes, og minst ett mangler navn.");
     }
 
-    return { landmarks, issues };
+    const outsideItems = outsideLandmarkItems();
+
+    if (outsideItems.length > 0) {
+      issues.push(`${outsideItems.length} synlige innholdselementer ligger utenfor landemerker.`);
+    }
+
+    return { landmarks, issues, outsideItems };
   }
 
   if (mode === "focus") {
