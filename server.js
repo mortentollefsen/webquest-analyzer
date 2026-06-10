@@ -1821,6 +1821,182 @@ async function getIds(page) {
   });
 }
 
+async function getFonts(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isVisible(element) {
+      const rect = element.getBoundingClientRect();
+
+      if (rect.width === 0 || rect.height === 0) {
+        return false;
+      }
+
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          node.getAttribute("aria-hidden") === "true" ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse"
+        ) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    function nearestColorName(red, green, blue) {
+      const colors = [
+        ["svart", 0, 0, 0],
+        ["hvit", 255, 255, 255],
+        ["mørk grå", 64, 64, 64],
+        ["grå", 128, 128, 128],
+        ["lys grå", 211, 211, 211],
+        ["sølvgrå", 192, 192, 192],
+        ["rød", 220, 20, 60],
+        ["mørk rød", 139, 0, 0],
+        ["lys rød", 255, 102, 102],
+        ["rosa", 255, 105, 180],
+        ["lys rosa", 255, 182, 193],
+        ["burgunder", 128, 0, 32],
+        ["oransje", 255, 140, 0],
+        ["mørk oransje", 204, 85, 0],
+        ["fersken", 255, 218, 185],
+        ["brun", 139, 69, 19],
+        ["mørk brun", 92, 64, 51],
+        ["beige", 245, 245, 220],
+        ["sand", 194, 178, 128],
+        ["gul", 255, 215, 0],
+        ["lys gul", 255, 255, 153],
+        ["oliven", 128, 128, 0],
+        ["limegrønn", 50, 205, 50],
+        ["grønn", 34, 139, 34],
+        ["mørk grønn", 0, 100, 0],
+        ["lys grønn", 144, 238, 144],
+        ["mintgrønn", 152, 255, 152],
+        ["turkis", 64, 224, 208],
+        ["mørk turkis", 0, 128, 128],
+        ["cyan", 0, 255, 255],
+        ["lys blå", 135, 206, 250],
+        ["blå", 30, 144, 255],
+        ["mørk blå", 0, 0, 139],
+        ["marineblå", 0, 31, 63],
+        ["blågrå", 96, 125, 139],
+        ["indigo", 75, 0, 130],
+        ["lilla", 128, 0, 128],
+        ["mørk lilla", 75, 0, 100],
+        ["lys lilla", 216, 191, 216],
+        ["magenta", 255, 0, 255],
+      ];
+      let best = colors[0];
+      let bestDistance = Number.POSITIVE_INFINITY;
+
+      colors.forEach((color) => {
+        const distance =
+          (red - color[1]) ** 2 +
+          (green - color[2]) ** 2 +
+          (blue - color[3]) ** 2;
+
+        if (distance < bestDistance) {
+          best = color;
+          bestDistance = distance;
+        }
+      });
+
+      return best[0];
+    }
+
+    function colorInfo(color) {
+      const match = color.match(/rgba?\(([^)]+)\)/);
+
+      if (!match) {
+        return { text: color, value: color };
+      }
+
+      const parts = match[1].split(",").map((part) => part.trim());
+      const red = Number(parts[0]);
+      const green = Number(parts[1]);
+      const blue = Number(parts[2]);
+      const alpha = parts[3] === undefined ? 1 : Number(parts[3]);
+      const hex = [red, green, blue]
+        .map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0"))
+        .join("");
+      const value = `#${hex}`;
+      const name = nearestColorName(red, green, blue);
+      const text = alpha < 1 ? `${value} (${name}), alfa ${alpha}` : `${value} (${name})`;
+
+      return { text, value };
+    }
+
+    function backgroundFor(element) {
+      for (let node = element; node; node = node.parentElement) {
+        const color = window.getComputedStyle(node).backgroundColor;
+
+        if (color && color !== "transparent" && color !== "rgba(0, 0, 0, 0)") {
+          return color;
+        }
+      }
+
+      return window.getComputedStyle(document.body).backgroundColor || "rgb(255, 255, 255)";
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    const seen = new Map();
+    const textElements = Array.from(document.querySelectorAll("body *"))
+      .filter((element) => isVisible(element))
+      .filter((element) => normalized(element.innerText || element.textContent))
+      .filter((element) => !Array.from(element.children).some((child) => normalized(child.innerText || child.textContent) === normalized(element.innerText || element.textContent)));
+
+    textElements.forEach((element) => {
+      const style = window.getComputedStyle(element);
+      const tag = element.tagName.toLowerCase();
+      const color = colorInfo(style.color);
+      const backgroundColor = colorInfo(backgroundFor(element));
+      const item = {
+        tag,
+        fontFamily: style.fontFamily,
+        fontSize: style.fontSize,
+        fontWeight: style.fontWeight,
+        fontStyle: style.fontStyle,
+        color: color.text,
+        colorValue: color.value,
+        backgroundColor: backgroundColor.text,
+        backgroundColorValue: backgroundColor.value,
+        sample: normalized(element.innerText || element.textContent).slice(0, 80),
+        selector: selectorFor(element),
+      };
+      const key = [
+        item.tag,
+        item.fontFamily,
+        item.fontSize,
+        item.fontWeight,
+        item.fontStyle,
+        item.color,
+        item.backgroundColor,
+      ].join("|");
+
+      if (!seen.has(key)) {
+        seen.set(key, item);
+      }
+    });
+
+    return Array.from(seen.values()).sort((a, b) => a.tag.localeCompare(b.tag));
+  });
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -1912,6 +2088,12 @@ const analyzers = {
       ...result,
     };
   },
+  fonts: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    fonts: await getFonts(page),
+  }),
 };
 
 app.use((req, res, next) => {
