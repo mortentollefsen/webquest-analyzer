@@ -530,8 +530,13 @@ function collectAccessibilityData(mode) {
     return Array.from(document.querySelectorAll("img, svg, input[type='image'], area")).map((image) => {
       const tagName = image.tagName.toLowerCase();
       const name = accessibleName(image);
+      const owner = image.closest("a[href], button, [role='link'], [role='button']");
+      const ownerName = owner ? accessibleName(owner) : { value: "", source: "ingen" };
       const hasAlt = image.hasAttribute("alt");
       const alt = image.getAttribute("alt") || "";
+      const role = normalized(image.getAttribute("role"));
+      const ariaHidden = image.closest("[aria-hidden='true']") !== null;
+      const isDecorative = ariaHidden || role === "presentation" || role === "none" || (hasAlt && alt === "");
       let altStatus = "mangler alt";
 
       if (hasAlt && alt === "") {
@@ -546,9 +551,13 @@ function collectAccessibilityData(mode) {
         altStatus,
         name: name.value,
         nameSource: name.source,
-        src: image.currentSrc || image.src || image.href || image.getAttribute("href") || "",
-        role: normalized(image.getAttribute("role")),
-        ariaHidden: image.getAttribute("aria-hidden") === "true",
+        ownerName: ownerName.value,
+        ownerNameSource: ownerName.source,
+        ownerRole: owner ? owner.tagName.toLowerCase() : "",
+        src: image.currentSrc || image.src || image.href?.baseVal || image.getAttribute("href") || "",
+        role,
+        ariaHidden,
+        isDecorative,
         selector: selectorFor(image),
       };
     });
