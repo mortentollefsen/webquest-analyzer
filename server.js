@@ -2,6 +2,7 @@ import express from "express";
 import { chromium } from "playwright";
 import dns from "node:dns/promises";
 import net from "node:net";
+import axe from "axe-core";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -2036,6 +2037,90 @@ async function getFonts(page) {
   });
 }
 
+async function getWcag(page) {
+  await page.addScriptTag({ content: axe.source });
+
+  return page.evaluate(async () => {
+    function wcagLevels(tags) {
+      const levels = new Set();
+
+      tags.forEach((tag) => {
+        if (tag === "wcag2a" || tag === "wcag21a" || tag === "wcag22a") levels.add("A");
+        if (tag === "wcag2aa" || tag === "wcag21aa" || tag === "wcag22aa") levels.add("AA");
+        if (tag === "wcag2aaa" || tag === "wcag21aaa" || tag === "wcag22aaa") levels.add("AAA");
+      });
+
+      if (levels.size === 0 && tags.includes("best-practice")) {
+        levels.add("Best practice");
+      }
+
+      if (levels.size === 0) {
+        levels.add("Ukjent");
+      }
+
+      return Array.from(levels);
+    }
+
+    function selectorForNode(node) {
+      return (node.target || []).join(", ");
+    }
+
+    function simplifyRule(rule) {
+      return {
+        id: rule.id,
+        impact: rule.impact || "",
+        help: rule.help || "",
+        description: rule.description || "",
+        helpUrl: rule.helpUrl || "",
+        tags: rule.tags || [],
+        levels: wcagLevels(rule.tags || []),
+        count: (rule.nodes || []).length,
+        examples: (rule.nodes || []).slice(0, 3).map((node) => ({
+          target: selectorForNode(node),
+          summary: node.failureSummary || node.any?.[0]?.message || node.none?.[0]?.message || "",
+        })),
+      };
+    }
+
+    const results = await window.axe.run(document, {
+      resultTypes: ["violations", "incomplete", "passes"],
+      runOnly: {
+        type: "tag",
+        values: [
+          "wcag2a",
+          "wcag2aa",
+          "wcag2aaa",
+          "wcag21a",
+          "wcag21aa",
+          "wcag21aaa",
+          "wcag22a",
+          "wcag22aa",
+          "wcag22aaa",
+          "best-practice",
+        ],
+      },
+    });
+    const violations = results.violations.map(simplifyRule);
+    const incomplete = results.incomplete.map(simplifyRule);
+    const passes = results.passes.map(simplifyRule);
+    const groups = {};
+
+    ["A", "AA", "AAA", "Best practice", "Ukjent"].forEach((level) => {
+      groups[level] = violations.filter((rule) => rule.levels.includes(level));
+    });
+
+    return {
+      summary: {
+        violations: violations.length,
+        incomplete: incomplete.length,
+        passes: passes.length,
+      },
+      groups,
+      incomplete,
+    };
+  });
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -2136,6 +2221,12 @@ const analyzers = {
     engine: "playwright",
     url,
     fonts: await getFonts(page),
+  }),
+  wcag: async (page, url) => ({
+    ok: true,
+    engine: "axe-core",
+    url,
+    wcag: await getWcag(page),
   }),
 };
 
