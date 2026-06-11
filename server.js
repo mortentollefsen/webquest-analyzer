@@ -655,6 +655,20 @@ function collectAccessibilityData(mode) {
   }
 
   if (mode === "images") {
+    function svgPreviewDataUrl(element) {
+      if (element.tagName.toLowerCase() !== "svg") {
+        return "";
+      }
+
+      try {
+        const svg = element.outerHTML;
+        const encoded = window.btoa(unescape(encodeURIComponent(svg)));
+        return `data:image/svg+xml;base64,${encoded}`;
+      } catch {
+        return "";
+      }
+    }
+
     return Array.from(document.querySelectorAll("img, svg, input[type='image'], area")).map((image) => {
       const tagName = image.tagName.toLowerCase();
       const name = accessibleName(image);
@@ -675,6 +689,8 @@ function collectAccessibilityData(mode) {
         altStatus = svgTitle(image) ? "svg title" : "mangler tekstalternativ";
       }
 
+      const src = image.currentSrc || image.src || image.href?.baseVal || image.getAttribute("href") || "";
+
       return {
         altStatus,
         name: name.value,
@@ -682,7 +698,8 @@ function collectAccessibilityData(mode) {
         ownerName: ownerName.value,
         ownerNameSource: ownerName.source,
         ownerRole: owner ? owner.tagName.toLowerCase() : "",
-        src: image.currentSrc || image.src || image.href?.baseVal || image.getAttribute("href") || "",
+        src,
+        previewSrc: src || svgPreviewDataUrl(image),
         role,
         ariaHidden,
         isDecorative,
