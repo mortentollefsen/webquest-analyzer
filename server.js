@@ -2696,6 +2696,85 @@ async function getScreenReaderReport(page, mode = "reader") {
   }, mode);
 }
 
+async function getColorblindSimulation(page, mode = "deuteranopia") {
+  const screenshot = await page.screenshot({
+    fullPage: true,
+    type: "png",
+  });
+  const screenshotDataUrl = `data:image/png;base64,${screenshot.toString("base64")}`;
+  const labels = {
+    protanopia: "rød fargeblindhet",
+    deuteranopia: "rød/grønn fargeblindhet",
+    tritanopia: "blå/gul fargeblindhet",
+    achromatopsia: "gråtoner",
+  };
+
+  const imageDataUrl = await page.evaluate(async ({ dataUrl, simulationMode }) => {
+    const matrices = {
+      protanopia: [
+        0.152286, 1.052583, -0.204868,
+        0.114503, 0.786281, 0.099216,
+        -0.003882, -0.048116, 1.051998,
+      ],
+      deuteranopia: [
+        0.367322, 0.860646, -0.227968,
+        0.280085, 0.672501, 0.047413,
+        -0.011820, 0.042940, 0.968881,
+      ],
+      tritanopia: [
+        1.255528, -0.076749, -0.178779,
+        -0.078411, 0.930809, 0.147602,
+        0.004733, 0.691367, 0.303900,
+      ],
+      achromatopsia: [
+        0.299, 0.587, 0.114,
+        0.299, 0.587, 0.114,
+        0.299, 0.587, 0.114,
+      ],
+    };
+    const matrix = matrices[simulationMode] || matrices.deuteranopia;
+    const image = new Image();
+
+    function clamp(value) {
+      return Math.max(0, Math.min(255, Math.round(value)));
+    }
+
+    await new Promise((resolve, reject) => {
+      image.onload = resolve;
+      image.onerror = () => reject(new Error("Skjermbildet kunne ikke behandles."));
+      image.src = dataUrl;
+    });
+
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    context.drawImage(image, 0, 0);
+
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    const data = imageData.data;
+
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+
+      data[index] = clamp((matrix[0] * r) + (matrix[1] * g) + (matrix[2] * b));
+      data[index + 1] = clamp((matrix[3] * r) + (matrix[4] * g) + (matrix[5] * b));
+      data[index + 2] = clamp((matrix[6] * r) + (matrix[7] * g) + (matrix[8] * b));
+    }
+
+    context.putImageData(imageData, 0, 0);
+    return canvas.toDataURL("image/png");
+  }, { dataUrl: screenshotDataUrl, simulationMode: mode });
+
+  return {
+    mode,
+    label: labels[mode] || labels.deuteranopia,
+    imageDataUrl,
+  };
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -2828,6 +2907,30 @@ const analyzers = {
     url,
     report: await getScreenReaderReport(page, "structure"),
     mode: "structure",
+  }),
+  colorblindprotanopia: async (page, url) => ({
+    ok: true,
+    engine: "playwright-screenshot",
+    url,
+    colorblind: await getColorblindSimulation(page, "protanopia"),
+  }),
+  colorblinddeuteranopia: async (page, url) => ({
+    ok: true,
+    engine: "playwright-screenshot",
+    url,
+    colorblind: await getColorblindSimulation(page, "deuteranopia"),
+  }),
+  colorblindtritanopia: async (page, url) => ({
+    ok: true,
+    engine: "playwright-screenshot",
+    url,
+    colorblind: await getColorblindSimulation(page, "tritanopia"),
+  }),
+  colorblindachromatopsia: async (page, url) => ({
+    ok: true,
+    engine: "playwright-screenshot",
+    url,
+    colorblind: await getColorblindSimulation(page, "achromatopsia"),
   }),
   wcag: async (page, url) => ({
     ok: true,
