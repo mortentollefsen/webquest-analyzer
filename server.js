@@ -2362,6 +2362,26 @@ async function getWcag(page) {
   });
 }
 
+async function getSource(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Kildekoden kunne ikke hentes. HTTP ${response.status}.`);
+  }
+
+  return response.text();
+}
+
+async function getDom(page) {
+  return page.content();
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -2469,6 +2489,18 @@ const analyzers = {
     url,
     fonts: await getFonts(page),
   }),
+  source: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    source: await getSource(url),
+  }),
+  dom: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    dom: await getDom(page),
+  }),
   wcag: async (page, url) => ({
     ok: true,
     engine: "axe-core",
@@ -2536,6 +2568,17 @@ app.get("/analyze", async (req, res) => {
 
   try {
     const url = await validatePublicUrl(requestedUrl);
+
+    if (command === "source") {
+      res.json({
+        ok: true,
+        engine: "fetch",
+        url,
+        source: await getSource(url),
+      });
+      return;
+    }
+
     const result = await analyzePage(url, (page) => analyzers[command](page, url));
 
     res.json(result);
