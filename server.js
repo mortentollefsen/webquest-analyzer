@@ -2383,46 +2383,12 @@ async function getDom(page) {
 }
 
 async function getScreenReaderReport(page, mode = "reader") {
-  const session = await page.context().newCDPSession(page);
-  const { nodes } = await session.send("Accessibility.getFullAXTree");
-  const byId = new Map(nodes.map((node) => [node.nodeId, node]));
-  const root = nodes.find((node) => !node.ignored && node.role?.value === "RootWebArea") ||
-    nodes.find((node) => !node.ignored);
-  const lines = [];
-  const maxLines = 500;
-
-  function axValue(value) {
-    if (!value) {
-      return "";
-    }
-
-    if (typeof value.value === "string" || typeof value.value === "number" || typeof value.value === "boolean") {
-      return String(value.value);
-    }
-
-    return "";
-  }
-
-  function propertyValue(node, name) {
-    const property = (node.properties || []).find((item) => item.name === name);
-    return axValue(property?.value);
-  }
-
-  function roleName(node) {
-    return axValue(node.role);
-  }
-
-  function nodeName(node) {
-    return axValue(node.name);
-  }
-
-  function nodeValue(node) {
-    return axValue(node.value);
-  }
-
-  function roleLabel(role) {
+  return page.evaluate((reportMode) => {
+    const maxLines = 900;
+    const lines = [];
+    const landmarkRoles = new Set(["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"]);
+    const controlRoles = new Set(["button", "link", "checkbox", "radio", "textbox", "combobox", "switch", "tab", "menuitem", "option"]);
     const labels = {
-      RootWebArea: "side",
       banner: "banner",
       navigation: "navigasjon",
       main: "hovedinnhold",
@@ -2434,130 +2400,300 @@ async function getScreenReaderReport(page, mode = "reader") {
       heading: "overskrift",
       link: "lenke",
       button: "knapp",
+      img: "bilde",
       image: "bilde",
       list: "liste",
       listitem: "listepunkt",
       table: "tabell",
-      row: "rad",
-      columnheader: "kolonneoverskrift",
-      rowheader: "radoverskrift",
-      cell: "celle",
       textbox: "tekstfelt",
       checkbox: "avkrysningsboks",
       radio: "radioknapp",
       combobox: "kombinasjonsboks",
-      StaticText: "tekst",
+      switch: "bryter",
     };
 
-    return labels[role] || role || "element";
-  }
-
-  function stateText(node) {
-    const states = [];
-    const checked = propertyValue(node, "checked");
-    const selected = propertyValue(node, "selected");
-    const expanded = propertyValue(node, "expanded");
-    const disabled = propertyValue(node, "disabled");
-    const required = propertyValue(node, "required");
-    const invalid = propertyValue(node, "invalid");
-
-    if (checked) states.push(`checked=${checked}`);
-    if (selected === "true") states.push("valgt");
-    if (expanded) states.push(`expanded=${expanded}`);
-    if (disabled === "true") states.push("deaktivert");
-    if (required === "true") states.push("påkrevd");
-    if (invalid && invalid !== "false") states.push(`ugyldig=${invalid}`);
-
-    return states.length ? ` (${states.join(", ")})` : "";
-  }
-
-  function readerLine(node) {
-    const role = roleName(node);
-    const name = nodeName(node);
-    const value = nodeValue(node);
-    const level = propertyValue(node, "level");
-    const label = roleLabel(role);
-
-    if (role === "RootWebArea") {
-      return name ? `Tittel: ${name}` : "";
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
     }
 
-    if (role === "heading") {
-      return `${label}${level ? ` nivå ${level}` : ""}: ${name || "uten tekst"}`;
+    function isHidden(element) {
+      if (!element || !(element instanceof Element)) {
+        return true;
+      }
+
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          node.getAttribute("aria-hidden") === "true" ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          style.contentVisibility === "hidden"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
     }
 
-    if (["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"].includes(role)) {
-      return name ? `Landemerke ${label}: ${name}` : `Landemerke ${label}`;
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 4; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
     }
 
-    if (["link", "button", "image", "textbox", "checkbox", "radio", "combobox"].includes(role)) {
-      return `${label}: ${name || value || "uten navn"}${stateText(node)}`;
+    function textFromSubtree(element) {
+      if (!element || isHidden(element)) {
+        return "";
+      }
+
+      return normalized(element.innerText || element.textContent);
     }
 
-    if (["list", "listitem", "table", "row", "columnheader", "rowheader", "cell"].includes(role)) {
-      return name ? `${label}: ${name}` : label;
+    function textFromIds(ids) {
+      return normalized(ids
+        .split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((element) => textFromSubtree(element))
+        .join(" "));
     }
 
-    if (role === "StaticText" && name) {
-      return name;
+    function labelText(element) {
+      const labelsForElement = element.labels ? Array.from(element.labels) : [];
+
+      if (!labelsForElement.length && element.id) {
+        labelsForElement.push(...document.querySelectorAll(`label[for="${CSS.escape(element.id)}"]`));
+      }
+
+      return normalized(labelsForElement.map((label) => textFromSubtree(label)).join(" "));
     }
 
-    if (name && !["generic", "none", "presentation"].includes(role)) {
-      return `${label}: ${name}${stateText(node)}`;
+    function svgTitle(element) {
+      const title = Array.from(element.children || []).find((child) => child.tagName.toLowerCase() === "title");
+      return title ? normalized(title.textContent) : "";
     }
 
-    return "";
-  }
+    function canNameFromContent(element) {
+      const tag = element.tagName.toLowerCase();
+      const role = normalized(element.getAttribute("role")).toLowerCase();
 
-  function structureLine(node, depth) {
-    const role = roleName(node);
-    const name = nodeName(node);
-    const value = nodeValue(node);
-    const level = propertyValue(node, "level");
-    const parts = [`role=${role || "ukjent"}`];
-
-    if (name) parts.push(`navn="${name}"`);
-    if (value && value !== name) parts.push(`verdi="${value}"`);
-    if (level) parts.push(`nivå=${level}`);
-
-    return `${"  ".repeat(depth)}- ${parts.join(", ")}${stateText(node)}`;
-  }
-
-  function shouldSkipStaticText(node, insideNamedWidget) {
-    return insideNamedWidget && roleName(node) === "StaticText";
-  }
-
-  function walk(node, depth = 0, insideNamedWidget = false) {
-    if (!node || node.ignored || lines.length >= maxLines) {
-      return;
+      return ["a", "button", "summary", "option", "legend", "label"].includes(tag) ||
+        controlRoles.has(role);
     }
 
-    const role = roleName(node);
-    const name = nodeName(node);
-    const currentInsideNamedWidget = insideNamedWidget ||
-      (Boolean(name) && ["link", "button", "heading", "checkbox", "radio", "textbox", "combobox"].includes(role));
+    function accessibleName(element) {
+      if (!(element instanceof Element) || isHidden(element)) {
+        return "";
+      }
 
-    if (!shouldSkipStaticText(node, insideNamedWidget)) {
-      const line = mode === "structure" ? structureLine(node, depth) : readerLine(node);
+      const labelledBy = normalized(element.getAttribute("aria-labelledby"));
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+      const tag = element.tagName.toLowerCase();
+      const type = (element.getAttribute("type") || "").toLowerCase();
 
-      if (line && line !== lines[lines.length - 1]) {
-        lines.push(line);
+      if (labelledBy) {
+        const text = textFromIds(labelledBy);
+        if (text) return text;
+      }
+
+      if (ariaLabel) return ariaLabel;
+
+      if (["img", "area"].includes(tag) || (tag === "input" && type === "image")) {
+        if (element.hasAttribute("alt")) return normalized(element.getAttribute("alt"));
+      }
+
+      if (["input", "select", "textarea", "output", "meter", "progress"].includes(tag)) {
+        const text = labelText(element);
+        if (text) return text;
+      }
+
+      if (tag === "input" && ["button", "submit", "reset"].includes(type)) {
+        const value = normalized(element.getAttribute("value"));
+        if (value) return value;
+      }
+
+      if (tag === "svg") {
+        const title = svgTitle(element);
+        if (title) return title;
+      }
+
+      if (canNameFromContent(element)) {
+        const text = textFromSubtree(element);
+        if (text) return text;
+      }
+
+      return normalized(element.getAttribute("title"));
+    }
+
+    function implicitRole(element) {
+      const explicitRole = normalized(element.getAttribute("role")).toLowerCase();
+      const tag = element.tagName.toLowerCase();
+      const type = (element.getAttribute("type") || "").toLowerCase();
+
+      if (explicitRole && !["none", "presentation"].includes(explicitRole)) return explicitRole;
+      if (tag === "header") return "banner";
+      if (tag === "nav") return "navigation";
+      if (tag === "main") return "main";
+      if (tag === "aside") return "complementary";
+      if (tag === "footer") return "contentinfo";
+      if (tag === "section" && accessibleName(element)) return "region";
+      if (tag === "form") return "form";
+      if (/^h[1-6]$/.test(tag)) return "heading";
+      if (tag === "a" && element.hasAttribute("href")) return "link";
+      if (tag === "button") return "button";
+      if (tag === "img" || tag === "svg") return "img";
+      if (["ul", "ol"].includes(tag)) return "list";
+      if (tag === "li") return "listitem";
+      if (tag === "table") return "table";
+      if (["textarea", "select"].includes(tag)) return tag === "select" ? "combobox" : "textbox";
+      if (tag === "input") {
+        if (["button", "submit", "reset"].includes(type)) return "button";
+        if (type === "checkbox") return "checkbox";
+        if (type === "radio") return "radio";
+        return "textbox";
+      }
+
+      return "";
+    }
+
+    function stateText(element) {
+      const states = [];
+
+      if (element.matches?.("input[type='checkbox'], input[type='radio']")) {
+        states.push(element.checked ? "avkrysset" : "ikke avkrysset");
+      }
+
+      if (element.getAttribute("aria-expanded")) states.push(`utvidet=${element.getAttribute("aria-expanded")}`);
+      if (element.getAttribute("aria-selected") === "true") states.push("valgt");
+      if (element.hasAttribute("disabled") || element.getAttribute("aria-disabled") === "true") states.push("deaktivert");
+      if (element.hasAttribute("required") || element.getAttribute("aria-required") === "true") states.push("påkrevd");
+      if (element.getAttribute("aria-invalid") && element.getAttribute("aria-invalid") !== "false") states.push("ugyldig");
+
+      return states.length ? ` (${states.join(", ")})` : "";
+    }
+
+    function addLine(line) {
+      const text = reportMode === "structure" ? String(line || "").replace(/\s+$/, "") : normalized(line);
+
+      if (!text || text === lines[lines.length - 1] || lines.length >= maxLines) {
+        return;
+      }
+
+      lines.push(text);
+    }
+
+    function readerLine(element, role) {
+      const tag = element.tagName.toLowerCase();
+      const name = accessibleName(element);
+      const text = textFromSubtree(element);
+      const label = labels[role] || role || tag;
+
+      if (role === "heading") {
+        return `Overskrift nivå ${tag.slice(1)}: ${text || name || "uten tekst"}`;
+      }
+
+      if (landmarkRoles.has(role)) {
+        return name ? `Landemerke ${label}: ${name}` : `Landemerke ${label}`;
+      }
+
+      if (role === "link") return `Lenke: ${name || text || "uten navn"}`;
+      if (role === "button") return `Knapp: ${name || text || "uten navn"}${stateText(element)}`;
+      if (role === "img") return `Bilde: ${name || "uten tekstalternativ"}`;
+      if (role === "list") return `${label}${element.children.length ? ` med ${element.children.length} punkter` : ""}`;
+      if (role === "listitem") return `Listepunkt: ${text || name || ""}`;
+      if (role === "table") return `Tabell${element.rows?.length ? ` med ${element.rows.length} rader` : ""}`;
+      if (["textbox", "checkbox", "radio", "combobox", "switch"].includes(role)) return `${label}: ${name || "uten navn"}${stateText(element)}`;
+      if (["p", "blockquote", "figcaption", "caption", "dt", "dd"].includes(tag)) return text;
+
+      return "";
+    }
+
+    function structureLine(element, role, depth) {
+      const tag = element.tagName.toLowerCase();
+      const name = accessibleName(element);
+      const text = textFromSubtree(element);
+      const parts = [`tag=${tag}`];
+
+      if (role) parts.push(`role=${role}`);
+      if (name) parts.push(`navn="${name}"`);
+      if (!name && text && text.length <= 80) parts.push(`tekst="${text}"`);
+      if (/^h[1-6]$/.test(tag)) parts.push(`nivå=${tag.slice(1)}`);
+      if (element.id) parts.push(`id=${element.id}`);
+
+      return `${"  ".repeat(depth)}- ${parts.join(", ")}`;
+    }
+
+    function isAtomicForReader(role, tag) {
+      return role === "heading" ||
+        ["link", "button", "img", "listitem", "table", "textbox", "checkbox", "radio", "combobox", "switch"].includes(role) ||
+        ["p", "blockquote", "figcaption", "caption", "dt", "dd"].includes(tag);
+    }
+
+    function isMeaningful(element, role) {
+      const tag = element.tagName.toLowerCase();
+
+      return Boolean(role) ||
+        ["p", "blockquote", "figcaption", "caption", "dt", "dd"].includes(tag) ||
+        Boolean(accessibleName(element));
+    }
+
+    function walk(element, depth = 0) {
+      if (!(element instanceof Element) || isHidden(element) || lines.length >= maxLines) {
+        return;
+      }
+
+      const tag = element.tagName.toLowerCase();
+      const role = implicitRole(element);
+
+      if (reportMode === "structure") {
+        if (isMeaningful(element, role)) {
+          addLine(structureLine(element, role, depth));
+        }
+
+        Array.from(element.children).forEach((child) => walk(child, depth + (isMeaningful(element, role) ? 1 : 0)));
+        return;
+      }
+
+      if (isMeaningful(element, role)) {
+        addLine(readerLine(element, role));
+      }
+
+      if (!isAtomicForReader(role, tag)) {
+        Array.from(element.children).forEach((child) => walk(child, depth + 1));
       }
     }
 
-    (node.childIds || []).forEach((childId) => walk(byId.get(childId), depth + 1, currentInsideNamedWidget));
-  }
+    addLine(`Tittel: ${document.title || "uten tittel"}`);
+    walk(document.body);
 
-  if (root) {
-    walk(root);
-  }
+    if (lines.length >= maxLines) {
+      lines.push(`... rapporten er avkortet etter ${maxLines} linjer.`);
+    }
 
-  if (nodes.length > maxLines) {
-    lines.push(`... rapporten er avkortet etter ${maxLines} linjer.`);
-  }
-
-  await session.detach();
-  return lines.join("\n");
+    return lines.join("\n");
+  }, mode);
 }
 
 const analyzers = {
