@@ -2026,6 +2026,17 @@ async function getTables(page) {
       const columns = rows > 0 ? Math.max(...Array.from(table.rows).map((row) => row.cells.length)) : 0;
       const headers = Array.from(table.querySelectorAll("th"));
       const caption = normalized(table.caption?.innerText || table.caption?.textContent || "");
+      const sampleRowLimit = 5;
+      const sampleColumnLimit = 8;
+      const sampleRows = Array.from(table.rows).slice(0, sampleRowLimit).map((row) => ({
+        cells: Array.from(row.cells).slice(0, sampleColumnLimit).map((cell) => ({
+          text: normalized(cell.innerText || cell.textContent).slice(0, 200),
+          header: cell.tagName.toLowerCase() === "th",
+          scope: normalized(cell.getAttribute("scope")),
+          colspan: cell.colSpan || 1,
+          rowspan: cell.rowSpan || 1,
+        })),
+      }));
 
       return {
         caption,
@@ -2034,6 +2045,11 @@ async function getTables(page) {
         headerCells: headers.length,
         missingScope: headers.some((header) => !header.hasAttribute("scope")),
         possibleLayout: headers.length === 0 && !caption,
+        sampleRows,
+        sampleRowLimit,
+        sampleColumnLimit,
+        truncatedRows: rows > sampleRowLimit,
+        truncatedColumns: columns > sampleColumnLimit,
         selector: selectorFor(table),
       };
     });
