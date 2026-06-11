@@ -2837,17 +2837,14 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
       continue;
     }
 
-    await page.evaluate((scrollY) => window.scrollTo(0, scrollY), y);
+    await page.evaluate((scrollY) => {
+      const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      window.scrollTo(0, Math.min(scrollY, maxScroll));
+    }, y);
     await page.waitForTimeout(150);
 
     const screenshot = await page.screenshot({
       type: "png",
-      clip: {
-        x: 0,
-        y,
-        width: Math.min(pageSize.width, 1400),
-        height,
-      },
     });
     const dataUrl = `data:image/png;base64,${screenshot.toString("base64")}`;
 
