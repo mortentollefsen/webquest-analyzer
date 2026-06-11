@@ -2382,6 +2382,184 @@ async function getDom(page) {
   return page.content();
 }
 
+async function getScreenReaderReport(page, mode = "reader") {
+  const session = await page.context().newCDPSession(page);
+  const { nodes } = await session.send("Accessibility.getFullAXTree");
+  const byId = new Map(nodes.map((node) => [node.nodeId, node]));
+  const root = nodes.find((node) => !node.ignored && node.role?.value === "RootWebArea") ||
+    nodes.find((node) => !node.ignored);
+  const lines = [];
+  const maxLines = 500;
+
+  function axValue(value) {
+    if (!value) {
+      return "";
+    }
+
+    if (typeof value.value === "string" || typeof value.value === "number" || typeof value.value === "boolean") {
+      return String(value.value);
+    }
+
+    return "";
+  }
+
+  function propertyValue(node, name) {
+    const property = (node.properties || []).find((item) => item.name === name);
+    return axValue(property?.value);
+  }
+
+  function roleName(node) {
+    return axValue(node.role);
+  }
+
+  function nodeName(node) {
+    return axValue(node.name);
+  }
+
+  function nodeValue(node) {
+    return axValue(node.value);
+  }
+
+  function roleLabel(role) {
+    const labels = {
+      RootWebArea: "side",
+      banner: "banner",
+      navigation: "navigasjon",
+      main: "hovedinnhold",
+      complementary: "tilleggsinnhold",
+      contentinfo: "bunntekst",
+      search: "søk",
+      form: "skjema",
+      region: "region",
+      heading: "overskrift",
+      link: "lenke",
+      button: "knapp",
+      image: "bilde",
+      list: "liste",
+      listitem: "listepunkt",
+      table: "tabell",
+      row: "rad",
+      columnheader: "kolonneoverskrift",
+      rowheader: "radoverskrift",
+      cell: "celle",
+      textbox: "tekstfelt",
+      checkbox: "avkrysningsboks",
+      radio: "radioknapp",
+      combobox: "kombinasjonsboks",
+      StaticText: "tekst",
+    };
+
+    return labels[role] || role || "element";
+  }
+
+  function stateText(node) {
+    const states = [];
+    const checked = propertyValue(node, "checked");
+    const selected = propertyValue(node, "selected");
+    const expanded = propertyValue(node, "expanded");
+    const disabled = propertyValue(node, "disabled");
+    const required = propertyValue(node, "required");
+    const invalid = propertyValue(node, "invalid");
+
+    if (checked) states.push(`checked=${checked}`);
+    if (selected === "true") states.push("valgt");
+    if (expanded) states.push(`expanded=${expanded}`);
+    if (disabled === "true") states.push("deaktivert");
+    if (required === "true") states.push("påkrevd");
+    if (invalid && invalid !== "false") states.push(`ugyldig=${invalid}`);
+
+    return states.length ? ` (${states.join(", ")})` : "";
+  }
+
+  function readerLine(node) {
+    const role = roleName(node);
+    const name = nodeName(node);
+    const value = nodeValue(node);
+    const level = propertyValue(node, "level");
+    const label = roleLabel(role);
+
+    if (role === "RootWebArea") {
+      return name ? `Tittel: ${name}` : "";
+    }
+
+    if (role === "heading") {
+      return `${label}${level ? ` nivå ${level}` : ""}: ${name || "uten tekst"}`;
+    }
+
+    if (["banner", "navigation", "main", "complementary", "contentinfo", "search", "form", "region"].includes(role)) {
+      return name ? `Landemerke ${label}: ${name}` : `Landemerke ${label}`;
+    }
+
+    if (["link", "button", "image", "textbox", "checkbox", "radio", "combobox"].includes(role)) {
+      return `${label}: ${name || value || "uten navn"}${stateText(node)}`;
+    }
+
+    if (["list", "listitem", "table", "row", "columnheader", "rowheader", "cell"].includes(role)) {
+      return name ? `${label}: ${name}` : label;
+    }
+
+    if (role === "StaticText" && name) {
+      return name;
+    }
+
+    if (name && !["generic", "none", "presentation"].includes(role)) {
+      return `${label}: ${name}${stateText(node)}`;
+    }
+
+    return "";
+  }
+
+  function structureLine(node, depth) {
+    const role = roleName(node);
+    const name = nodeName(node);
+    const value = nodeValue(node);
+    const level = propertyValue(node, "level");
+    const parts = [`role=${role || "ukjent"}`];
+
+    if (name) parts.push(`navn="${name}"`);
+    if (value && value !== name) parts.push(`verdi="${value}"`);
+    if (level) parts.push(`nivå=${level}`);
+
+    return `${"  ".repeat(depth)}- ${parts.join(", ")}${stateText(node)}`;
+  }
+
+  function shouldSkipStaticText(node, insideNamedWidget) {
+    return insideNamedWidget && roleName(node) === "StaticText";
+  }
+
+  function walk(node, depth = 0, insideNamedWidget = false) {
+    if (!node || node.ignored || lines.length >= maxLines) {
+      return;
+    }
+
+    const role = roleName(node);
+    const name = nodeName(node);
+    const currentInsideNamedWidget = insideNamedWidget ||
+      (Boolean(name) && ["link", "button", "heading", "checkbox", "radio", "textbox", "combobox"].includes(role));
+
+    if (!shouldSkipStaticText(node, insideNamedWidget)) {
+      const line = mode === "structure" ? structureLine(node, depth) : readerLine(node);
+
+      if (line && line !== lines[lines.length - 1]) {
+        lines.push(line);
+      }
+    }
+
+    (node.childIds || []).forEach((childId) => walk(byId.get(childId), depth + 1, currentInsideNamedWidget));
+  }
+
+  if (root) {
+    walk(root);
+  }
+
+  if (nodes.length > maxLines) {
+    lines.push(`... rapporten er avkortet etter ${maxLines} linjer.`);
+  }
+
+  await session.detach();
+  return lines.join("\n");
+}
+
 const analyzers = {
   headings: async (page, url) => ({
     ok: true,
@@ -2500,6 +2678,20 @@ const analyzers = {
     engine: "playwright",
     url,
     dom: await getDom(page),
+  }),
+  screenreader: async (page, url) => ({
+    ok: true,
+    engine: "chrome-accessibility-tree",
+    url,
+    report: await getScreenReaderReport(page, "reader"),
+    mode: "reader",
+  }),
+  screenreaderstructure: async (page, url) => ({
+    ok: true,
+    engine: "chrome-accessibility-tree",
+    url,
+    report: await getScreenReaderReport(page, "structure"),
+    mode: "structure",
   }),
   wcag: async (page, url) => ({
     ok: true,
