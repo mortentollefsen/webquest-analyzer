@@ -2,6 +2,7 @@ import express from "express";
 import { chromium } from "playwright";
 import dns from "node:dns/promises";
 import net from "node:net";
+import crypto from "node:crypto";
 import axe from "axe-core";
 
 const app = express();
@@ -2756,6 +2757,15 @@ async function hideCookieOverlays(page) {
       element.dataset.webquestPreviousDisplay = element.style.display || "";
       element.style.setProperty("display", "none", "important");
     });
+
+    [document.documentElement, document.body].forEach((element) => {
+      if (!element) {
+        return;
+      }
+
+      element.style.setProperty("overflow", "auto", "important");
+      element.style.setProperty("position", "static", "important");
+    });
   });
 }
 
@@ -2783,6 +2793,9 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
   const chunkHeight = Math.max(600, Math.min(pageSize.viewportHeight || 900, 1100));
   const chunkCount = Math.max(1, Math.min(Math.ceil(pageSize.height / chunkHeight), 12));
   const images = [];
+  const seenScreenshotHashes = new Set();
+  const seenScrollPositions = new Set();
+  let duplicateScreenshots = 0;
 
   async function simulateImage(dataUrl) {
     return page.evaluate(async ({ dataUrl, simulationMode }) => {
@@ -2853,23 +2866,46 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
       continue;
     }
 
-    await page.evaluate((scrollY) => {
-      const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-      window.scrollTo(0, Math.min(scrollY, maxScroll));
+    const actualY = await page.evaluate((scrollY) => {
+      const scrollingElement = document.scrollingElement || document.documentElement;
+      const maxScroll = Math.max(0, scrollingElement.scrollHeight - window.innerHeight);
+      const target = Math.min(scrollY, maxScroll);
+      scrollingElement.scrollTop = target;
+      window.scrollTo(0, target);
+      return Math.round(window.scrollY || scrollingElement.scrollTop || 0);
     }, y);
+
+    if (seenScrollPositions.has(actualY) && index > 0) {
+      break;
+    }
+
+    seenScrollPositions.add(actualY);
     await page.waitForTimeout(150);
 
     const screenshot = await page.screenshot({
       type: "png",
     });
+    const hash = crypto.createHash("sha256").update(screenshot).digest("hex");
+
+    if (seenScreenshotHashes.has(hash)) {
+      duplicateScreenshots += 1;
+      continue;
+    }
+
+    seenScreenshotHashes.add(hash);
     const dataUrl = `data:image/png;base64,${screenshot.toString("base64")}`;
 
     images.push({
       imageDataUrl: await simulateImage(dataUrl),
-      part: index + 1,
-      parts: chunkCount,
+      part: images.length + 1,
+      parts: 0,
+      scrollY: actualY,
     });
   }
+
+  images.forEach((image) => {
+    image.parts = images.length;
+  });
 
   return {
     mode,
@@ -2877,6 +2913,7 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
     imageDataUrl: images[0]?.imageDataUrl || "",
     images,
     hiddenCookieBanners: await countHiddenCookieOverlays(page),
+    duplicateScreenshots,
     truncated: Math.ceil(pageSize.height / chunkHeight) > chunkCount,
   };
 }
