@@ -2696,20 +2696,80 @@ async function getScreenReaderReport(page, mode = "reader") {
   }, mode);
 }
 
-async function getColorblindSimulation(page, mode = "deuteranopia") {
-  const screenshot = await page.screenshot({
-    fullPage: true,
-    type: "png",
+async function hideCookieOverlays(page) {
+  await page.evaluate(() => {
+    const cookiePattern = /cookie|cookies|informasjonskaps|samtykke|consent|personvern|privacy/i;
+    const actionPattern = /godta|aksepter|accept|tillat|avvis|reject|administrer|innstillinger/i;
+
+    function visibleText(element) {
+      return String(element.innerText || element.textContent || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isOverlay(element) {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+
+      if (rect.width < 150 || rect.height < 40) {
+        return false;
+      }
+
+      return ["fixed", "sticky"].includes(style.position) ||
+        element.getAttribute("role") === "dialog" ||
+        element.getAttribute("role") === "alertdialog" ||
+        element.getAttribute("aria-modal") === "true";
+    }
+
+    Array.from(document.body.querySelectorAll("*")).forEach((element) => {
+      if (!(element instanceof HTMLElement) || element.dataset.webquestHiddenCookieOverlay === "true") {
+        return;
+      }
+
+      const text = visibleText(element);
+
+      if (!text || text.length > 2500 || !cookiePattern.test(text) || !isOverlay(element)) {
+        return;
+      }
+
+      const hasAction = actionPattern.test(text) || element.querySelector("button, a[href], [role='button']");
+
+      if (!hasAction) {
+        return;
+      }
+
+      element.dataset.webquestHiddenCookieOverlay = "true";
+      element.dataset.webquestPreviousDisplay = element.style.display || "";
+      element.style.setProperty("display", "none", "important");
+    });
   });
-  const screenshotDataUrl = `data:image/png;base64,${screenshot.toString("base64")}`;
+}
+
+async function countHiddenCookieOverlays(page) {
+  return page.evaluate(() =>
+    document.querySelectorAll("[data-webquest-hidden-cookie-overlay='true']").length
+  );
+}
+
+async function getColorblindSimulation(page, mode = "deuteranopia") {
+  await hideCookieOverlays(page);
+
   const labels = {
     protanopia: "rød fargeblindhet",
     deuteranopia: "rød/grønn fargeblindhet",
     tritanopia: "blå/gul fargeblindhet",
     achromatopsia: "gråtoner",
   };
+  const pageSize = await page.evaluate(() => ({
+    width: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth, window.innerWidth),
+    height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight, window.innerHeight),
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  }));
+  const chunkHeight = Math.max(600, Math.min(pageSize.viewportHeight || 900, 1100));
+  const chunkCount = Math.max(1, Math.min(Math.ceil(pageSize.height / chunkHeight), 12));
+  const images = [];
 
-  const imageDataUrl = await page.evaluate(async ({ dataUrl, simulationMode }) => {
+  async function simulateImage(dataUrl) {
+    return page.evaluate(async ({ dataUrl, simulationMode }) => {
     const matrices = {
       protanopia: [
         0.152286, 1.052583, -0.204868,
@@ -2766,12 +2826,45 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
 
     context.putImageData(imageData, 0, 0);
     return canvas.toDataURL("image/png");
-  }, { dataUrl: screenshotDataUrl, simulationMode: mode });
+    }, { dataUrl, simulationMode: mode });
+  }
+
+  for (let index = 0; index < chunkCount; index += 1) {
+    const y = index * chunkHeight;
+    const height = Math.min(chunkHeight, pageSize.height - y);
+
+    if (height <= 0) {
+      continue;
+    }
+
+    await page.evaluate((scrollY) => window.scrollTo(0, scrollY), y);
+    await page.waitForTimeout(150);
+
+    const screenshot = await page.screenshot({
+      type: "png",
+      clip: {
+        x: 0,
+        y,
+        width: Math.min(pageSize.width, 1400),
+        height,
+      },
+    });
+    const dataUrl = `data:image/png;base64,${screenshot.toString("base64")}`;
+
+    images.push({
+      imageDataUrl: await simulateImage(dataUrl),
+      part: index + 1,
+      parts: chunkCount,
+    });
+  }
 
   return {
     mode,
     label: labels[mode] || labels.deuteranopia,
-    imageDataUrl,
+    imageDataUrl: images[0]?.imageDataUrl || "",
+    images,
+    hiddenCookieBanners: await countHiddenCookieOverlays(page),
+    truncated: Math.ceil(pageSize.height / chunkHeight) > chunkCount,
   };
 }
 
