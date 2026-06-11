@@ -1541,6 +1541,154 @@ async function getLinks(page) {
   });
 }
 
+async function getBrokenLinks(page, pageUrl) {
+  const linkResult = await getLinks(page);
+  const links = linkResult.links || [];
+  const anchors = await page.evaluate(() => {
+    const ids = new Set(Array.from(document.querySelectorAll("[id]")).map((element) => element.id));
+    const names = new Set(Array.from(document.querySelectorAll("a[name]")).map((element) => element.getAttribute("name")));
+
+    return {
+      ids: Array.from(ids),
+      names: Array.from(names),
+    };
+  });
+  const anchorTargets = new Set([...anchors.ids, ...anchors.names]);
+  const pageOriginUrl = new URL(pageUrl);
+  pageOriginUrl.hash = "";
+  const uniqueLinks = new Map();
+  const checked = [];
+  const broken = [];
+  const skipped = [];
+
+  links.forEach((link) => {
+    if (!uniqueLinks.has(link.href)) {
+      uniqueLinks.set(link.href, link);
+    }
+  });
+
+  async function checkHttpLink(link) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    try {
+      let response = await fetch(link.href, {
+        method: "HEAD",
+        redirect: "follow",
+        signal: controller.signal,
+      });
+
+      if (response.status === 405 || response.status === 403) {
+        response = await fetch(link.href, {
+          method: "GET",
+          redirect: "follow",
+          signal: controller.signal,
+        });
+      }
+
+      checked.push({
+        ...link,
+        status: response.status,
+        statusText: response.statusText || "",
+      });
+
+      if (response.status >= 400) {
+        broken.push({
+          ...link,
+          reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
+        });
+      }
+    } catch (error) {
+      broken.push({
+        ...link,
+        reason: error.name === "AbortError" ? "Tidsavbrudd" : "Kunne ikke nå lenken",
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function checkLink(link) {
+    let parsed;
+
+    try {
+      parsed = new URL(link.href);
+    } catch {
+      broken.push({
+        ...link,
+        reason: "Ugyldig URL",
+      });
+      return;
+    }
+
+    if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+      const withoutHash = new URL(parsed.href);
+      withoutHash.hash = "";
+
+      if (withoutHash.href === pageOriginUrl.href && parsed.hash) {
+        let target = parsed.hash.slice(1);
+
+        try {
+          target = decodeURIComponent(target);
+        } catch {
+          // Keep the raw hash if it is not valid percent-encoded text.
+        }
+
+        checked.push({
+          ...link,
+          status: target ? "anker" : "side",
+          statusText: "",
+        });
+
+        if (target && !anchorTargets.has(target)) {
+          broken.push({
+            ...link,
+            reason: `Mangler anker: #${target}`,
+          });
+        }
+
+        return;
+      }
+
+      try {
+        await validatePublicUrl(parsed.href);
+      } catch {
+        skipped.push({
+          ...link,
+          reason: "Ikke en offentlig http/https-URL",
+        });
+        return;
+      }
+
+      await checkHttpLink(link);
+      return;
+    }
+
+    skipped.push({
+      ...link,
+      reason: `Hoppet over ${parsed.protocol.replace(":", "")}-lenke`,
+    });
+  }
+
+  const queue = Array.from(uniqueLinks.values());
+  const workers = Array.from({ length: Math.min(8, queue.length) }, async () => {
+    while (queue.length > 0) {
+      const link = queue.shift();
+      await checkLink(link);
+    }
+  });
+
+  await Promise.all(workers);
+
+  return {
+    checkedCount: checked.length,
+    skippedCount: skipped.length,
+    totalCount: uniqueLinks.size,
+    broken,
+    skipped,
+  };
+}
+
 async function getImages(page) {
   const images = await page.evaluate(collectAccessibilityData, "images");
 
@@ -2249,6 +2397,12 @@ const analyzers = {
       ...result,
     };
   },
+  brokenlinks: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    brokenLinks: await getBrokenLinks(page, url),
+  }),
   images: async (page, url) => ({
     ok: true,
     engine: "playwright",
