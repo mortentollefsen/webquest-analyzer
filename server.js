@@ -669,7 +669,31 @@ function collectAccessibilityData(mode) {
       }
     }
 
-    return Array.from(document.querySelectorAll("img, svg, input[type='image'], area")).map((image) => {
+    function backgroundImageUrls(element) {
+      const style = window.getComputedStyle(element);
+      const value = style.backgroundImage || "";
+      const urls = [];
+      const pattern = /url\((['"]?)(.*?)\1\)/g;
+      let match;
+
+      while ((match = pattern.exec(value)) !== null) {
+        const rawUrl = normalized(match[2]);
+
+        if (!rawUrl) {
+          continue;
+        }
+
+        try {
+          urls.push(new URL(rawUrl, document.baseURI).href);
+        } catch {
+          urls.push(rawUrl);
+        }
+      }
+
+      return urls;
+    }
+
+    const htmlImages = Array.from(document.querySelectorAll("img, svg, input[type='image'], area")).map((image) => {
       const tagName = image.tagName.toLowerCase();
       const name = accessibleName(image);
       const owner = image.closest("a[href], button, [role='link'], [role='button']");
@@ -686,13 +710,14 @@ function collectAccessibilityData(mode) {
       } else if (hasAlt) {
         altStatus = alt;
       } else if (tagName === "svg") {
-        altStatus = svgTitle(image) ? "svg title" : "mangler tekstalternativ";
+        altStatus = svgTitle(image) || "mangler tekstalternativ";
       }
 
       const src = image.currentSrc || image.src || image.href?.baseVal || image.getAttribute("href") || "";
 
       return {
         altStatus,
+        elementType: tagName,
         name: name.value,
         nameSource: name.source,
         ownerName: ownerName.value,
@@ -706,6 +731,34 @@ function collectAccessibilityData(mode) {
         selector: selectorFor(image),
       };
     });
+
+    const cssBackgroundImages = Array.from(document.querySelectorAll("body *"))
+      .filter((element) => !isHidden(element))
+      .flatMap((element) => {
+        const rect = element.getBoundingClientRect();
+
+        if (rect.width < 1 || rect.height < 1) {
+          return [];
+        }
+
+        return backgroundImageUrls(element).map((src) => ({
+          altStatus: "CSS-bakgrunnsbilde",
+          elementType: "css-background",
+          name: "",
+          nameSource: "CSS background-image",
+          ownerName: "",
+          ownerNameSource: "",
+          ownerRole: "",
+          src,
+          previewSrc: src,
+          role: normalized(element.getAttribute("role")),
+          ariaHidden: element.closest("[aria-hidden='true']") !== null,
+          isDecorative: true,
+          selector: selectorFor(element),
+        }));
+      });
+
+    return [...htmlImages, ...cssBackgroundImages];
   }
 
   if (mode === "landmarks") {
@@ -1489,7 +1542,30 @@ async function getLinks(page) {
 }
 
 async function getImages(page) {
-  return page.evaluate(collectAccessibilityData, "images");
+  const images = await page.evaluate(collectAccessibilityData, "images");
+
+  for (const image of images) {
+    if (image.src || !image.selector || image.elementType === "area") {
+      continue;
+    }
+
+    try {
+      const locator = page.locator(image.selector).first();
+      const box = await locator.boundingBox({ timeout: 1000 });
+
+      if (!box || box.width < 1 || box.height < 1) {
+        continue;
+      }
+
+      const buffer = await locator.screenshot({ type: "png", timeout: 2000 });
+      image.previewSrc = `data:image/png;base64,${buffer.toString("base64")}`;
+      image.previewSource = "element-screenshot";
+    } catch {
+      image.previewSource = image.previewSrc ? "svg-data-url" : "none";
+    }
+  }
+
+  return images;
 
   return page.evaluate(() => {
     function normalized(text) {
