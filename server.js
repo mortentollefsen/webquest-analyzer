@@ -2119,6 +2119,247 @@ async function getIds(page) {
   });
 }
 
+async function getAriaPointers(page) {
+  return page.evaluate(() => {
+    const idReferenceAttributes = [
+      "aria-labelledby",
+      "aria-describedby",
+      "aria-controls",
+      "aria-owns",
+      "aria-activedescendant",
+      "aria-details",
+      "aria-errormessage",
+      "aria-flowto",
+    ];
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    function isHidden(element) {
+      if (!element || !(element instanceof Element)) {
+        return false;
+      }
+
+      if (element.tagName.toLowerCase() === "input" && element.type === "hidden") {
+        return true;
+      }
+
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          node.getAttribute("aria-hidden") === "true" ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          style.contentVisibility === "hidden"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    function labelText(element) {
+      const labels = element.labels ? Array.from(element.labels) : [];
+
+      if (!labels.length && element.id) {
+        labels.push(...document.querySelectorAll(`label[for="${CSS.escape(element.id)}"]`));
+      }
+
+      return normalized(labels.map((label) => label.innerText || label.textContent).join(" "));
+    }
+
+    function svgTitle(element) {
+      const title = Array.from(element.children || []).find((child) => child.tagName.toLowerCase() === "title");
+      return title ? normalized(title.textContent) : "";
+    }
+
+    function accessibleName(element) {
+      if (!(element instanceof Element)) {
+        return { value: "", source: "ingen" };
+      }
+
+      const labelledBy = normalized(element.getAttribute("aria-labelledby"));
+
+      if (labelledBy) {
+        const value = normalized(labelledBy
+          .split(/\s+/)
+          .map((id) => document.getElementById(id))
+          .filter(Boolean)
+          .map((target) => target.innerText || target.textContent)
+          .join(" "));
+
+        if (value) {
+          return { value, source: "aria-labelledby" };
+        }
+      }
+
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+
+      if (ariaLabel) {
+        return { value: ariaLabel, source: "aria-label" };
+      }
+
+      const tag = element.tagName.toLowerCase();
+      const type = (element.getAttribute("type") || "").toLowerCase();
+
+      if (["img", "area"].includes(tag) || (tag === "input" && type === "image")) {
+        if (element.hasAttribute("alt")) {
+          return { value: normalized(element.getAttribute("alt")), source: "alt" };
+        }
+      }
+
+      if (["input", "select", "textarea", "output", "meter", "progress"].includes(tag)) {
+        const text = labelText(element);
+
+        if (text) {
+          return { value: text, source: "label" };
+        }
+      }
+
+      if (tag === "input" && ["button", "submit", "reset"].includes(type)) {
+        const value = normalized(element.getAttribute("value"));
+
+        if (value) {
+          return { value, source: "value" };
+        }
+      }
+
+      if (tag === "svg") {
+        const title = svgTitle(element);
+
+        if (title) {
+          return { value: title, source: "svg title" };
+        }
+      }
+
+      if (["a", "button", "summary", "option", "legend", "label"].includes(tag)) {
+        const text = normalized(element.innerText || element.textContent);
+
+        if (text) {
+          return { value: text, source: "innhold" };
+        }
+      }
+
+      const title = normalized(element.getAttribute("title"));
+
+      if (title) {
+        return { value: title, source: "title" };
+      }
+
+      return { value: "", source: "ingen" };
+    }
+
+    function matchingIds(id) {
+      return Array.from(document.querySelectorAll("[id]")).filter((element) => element.id === id);
+    }
+
+    const references = [];
+    const issues = [];
+    let referenceCount = 0;
+
+    Array.from(document.querySelectorAll("*")).forEach((element) => {
+      idReferenceAttributes.forEach((attribute) => {
+        if (!element.hasAttribute(attribute)) {
+          return;
+        }
+
+        const ids = normalized(element.getAttribute(attribute)).split(/\s+/).filter(Boolean);
+
+        if (!ids.length) {
+          issues.push(`${attribute} er tom på ${selectorFor(element)}.`);
+          return;
+        }
+
+        referenceCount += ids.length;
+        const name = accessibleName(element);
+        const targets = ids.map((id) => {
+          const matches = matchingIds(id);
+          const first = matches[0] || null;
+          const targetName = first ? accessibleName(first) : { value: "", source: "ingen" };
+          const text = first ? normalized(targetName.value || first.innerText || first.textContent).slice(0, 180) : "";
+          const hidden = first ? isHidden(first) : false;
+
+          if (!first) {
+            issues.push(`${attribute} på ${selectorFor(element)} peker til manglende id: ${id}.`);
+          } else {
+            if (matches.length > 1) {
+              issues.push(`${attribute} på ${selectorFor(element)} peker til duplikat id: ${id} (${matches.length} forekomster).`);
+            }
+
+            if (!text) {
+              issues.push(`${attribute} på ${selectorFor(element)} peker til et element uten tekst/navn: ${id}.`);
+            }
+
+            if (hidden) {
+              issues.push(`${attribute} på ${selectorFor(element)} peker til et skjult element: ${id}.`);
+            }
+          }
+
+          return {
+            id,
+            count: matches.length,
+            element: first ? first.tagName.toLowerCase() : "",
+            text,
+            nameSource: targetName.source,
+            hidden,
+            selector: first ? selectorFor(first) : "",
+          };
+        });
+
+        references.push({
+          element: element.tagName.toLowerCase(),
+          role: normalized(element.getAttribute("role")),
+          name: name.value,
+          nameSource: name.source,
+          selector: selectorFor(element),
+          attribute,
+          ids,
+          targets,
+        });
+      });
+    });
+
+    return {
+      references,
+      issues,
+      summary: {
+        elements: references.length,
+        idReferences: referenceCount,
+        issues: issues.length,
+      },
+    };
+  });
+}
+
 async function getFonts(page) {
   return page.evaluate(() => {
     function normalized(text) {
@@ -2989,6 +3230,16 @@ const analyzers = {
   }),
   aria: async (page, url) => {
     const result = await getAriaIssues(page);
+
+    return {
+      ok: true,
+      engine: "playwright",
+      url,
+      ...result,
+    };
+  },
+  ariapointers: async (page, url) => {
+    const result = await getAriaPointers(page);
 
     return {
       ok: true,
