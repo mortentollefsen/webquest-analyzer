@@ -108,6 +108,7 @@ function setCorsHeaders(req, res) {
 async function analyzePage(url, analyzer) {
   const browser = await getBrowser();
   const context = await browser.newContext({
+    bypassCSP: true,
     locale: "nb-NO",
     userAgent:
       "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
