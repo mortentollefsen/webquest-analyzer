@@ -3193,6 +3193,102 @@ async function getCssElement(page, selector) {
   }, selector);
 }
 
+async function getElementExtracts(page, selector) {
+  const result = await page.evaluate((selectorValue) => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    let matches;
+
+    try {
+      matches = document.querySelectorAll(selectorValue);
+    } catch {
+      return {
+        selector: selectorValue,
+        count: 0,
+        items: [],
+        error: "Ugyldig CSS-selector.",
+      };
+    }
+
+    const items = Array.from(matches).slice(0, 10).map((element, index) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+
+      return {
+        index,
+        element: element.tagName.toLowerCase(),
+        id: element.id || "",
+        classes: typeof element.className === "string" ? element.className : "",
+        text: normalized(element.innerText || element.textContent).slice(0, 250),
+        selector: selectorFor(element),
+        html: element.outerHTML.slice(0, 2500),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        visible: rect.width > 0 &&
+          rect.height > 0 &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          style.visibility !== "collapse",
+      };
+    });
+
+    return {
+      selector: selectorValue,
+      count: matches.length,
+      items,
+      truncated: matches.length > items.length,
+    };
+  }, selector);
+
+  if (result.error) {
+    return result;
+  }
+
+  for (const item of result.items) {
+    if (!item.visible) {
+      item.screenshotError = "Elementet er skjult eller har ingen synlig størrelse.";
+      continue;
+    }
+
+    try {
+      const locator = page.locator(selector).nth(item.index);
+      await locator.scrollIntoViewIfNeeded({ timeout: 3000 });
+      const buffer = await locator.screenshot({ type: "png", timeout: 5000 });
+      item.imageDataUrl = `data:image/png;base64,${buffer.toString("base64")}`;
+    } catch {
+      item.screenshotError = "Kunne ikke lage skjermbilde av elementet.";
+    }
+  }
+
+  return result;
+}
+
 async function getWcag(page) {
   await page.addScriptTag({ content: axe.source });
 
@@ -4222,6 +4318,12 @@ const analyzers = {
     engine: "html-validate",
     url,
     html: await getHtmlValidation(url),
+  }),
+  hentelement: async (page, url, options = {}) => ({
+    ok: true,
+    engine: "playwright-screenshot",
+    url,
+    elementExtracts: await getElementExtracts(page, options.selector || "body"),
   }),
   source: async (page, url) => ({
     ok: true,
