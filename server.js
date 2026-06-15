@@ -4,6 +4,7 @@ import dns from "node:dns/promises";
 import net from "node:net";
 import crypto from "node:crypto";
 import axe from "axe-core";
+import { HtmlValidate } from "html-validate";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -16,6 +17,9 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 let browserPromise;
 let persistentContextPromise;
 const crcTable = createCrcTable();
+const htmlValidator = new HtmlValidate({
+  extends: ["html-validate:recommended"],
+});
 
 function getBrowser() {
   if (!browserPromise) {
@@ -2890,6 +2894,48 @@ async function getSource(url) {
   return response.text();
 }
 
+function sourceExcerpt(source, line, column, size = 1) {
+  if (!source || !line) {
+    return "";
+  }
+
+  const lines = source.split(/\r?\n/);
+  const text = lines[line - 1] || "";
+  const start = Math.max(0, (column || 1) - 41);
+  const end = Math.min(text.length, (column || 1) + Math.max(size, 1) + 40);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < text.length ? "..." : "";
+
+  return `${prefix}${text.slice(start, end)}${suffix}`.trim();
+}
+
+async function getHtmlValidation(url) {
+  const source = await getSource(url);
+  const report = await htmlValidator.validateString(source, url);
+  const messages = (report.results || [])
+    .flatMap((result) => result.messages || [])
+    .map((message) => ({
+      type: message.severity === 2 ? "feil" : "advarsel",
+      ruleId: message.ruleId || "",
+      message: message.message || "",
+      line: message.line || 0,
+      column: message.column || 0,
+      selector: message.selector || "",
+      ruleUrl: message.ruleUrl || "",
+      excerpt: sourceExcerpt(source, message.line, message.column, message.size),
+    }));
+
+  return {
+    valid: report.valid,
+    errorCount: report.errorCount || 0,
+    warningCount: report.warningCount || 0,
+    messageCount: messages.length,
+    checkedCharacters: source.length,
+    messages: messages.slice(0, 100),
+    truncated: messages.length > 100,
+  };
+}
+
 async function getDom(page) {
   return page.content();
 }
@@ -3729,6 +3775,12 @@ const analyzers = {
     engine: "playwright",
     url,
     fonts: await getFonts(page),
+  }),
+  html: async (page, url) => ({
+    ok: true,
+    engine: "html-validate",
+    url,
+    html: await getHtmlValidation(url),
   }),
   source: async (page, url) => ({
     ok: true,
