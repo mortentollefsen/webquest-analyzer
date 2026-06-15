@@ -2794,6 +2794,405 @@ async function getFonts(page) {
   });
 }
 
+async function getCssOverview(page) {
+  return page.evaluate(() => {
+    const links = Array.from(document.querySelectorAll("link[rel~='stylesheet']")).map((link) => ({
+      href: link.href || link.getAttribute("href") || "",
+      media: link.media || "",
+      disabled: link.disabled,
+    }));
+    const styleElements = document.querySelectorAll("style").length;
+    const inlineStyles = document.querySelectorAll("[style]").length;
+    let readableStyleSheets = 0;
+    let blockedStyleSheets = 0;
+    let ruleCount = 0;
+
+    Array.from(document.styleSheets).forEach((sheet) => {
+      try {
+        ruleCount += sheet.cssRules.length;
+        readableStyleSheets += 1;
+      } catch {
+        blockedStyleSheets += 1;
+      }
+    });
+
+    const issues = [];
+
+    if (inlineStyles > 0) {
+      issues.push(`${inlineStyles} elementer bruker inline style-attributt.`);
+    }
+
+    if (blockedStyleSheets > 0) {
+      issues.push(`${blockedStyleSheets} CSS-filer kunne ikke leses av nettleseren, ofte på grunn av CORS.`);
+    }
+
+    return {
+      summary: {
+        stylesheetLinks: links.length,
+        styleElements,
+        inlineStyles,
+        readableStyleSheets,
+        blockedStyleSheets,
+        ruleCount,
+      },
+      stylesheets: links.slice(0, 50),
+      issues,
+    };
+  });
+}
+
+async function getCssHidden(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) return `#${CSS.escape(element.id)}`;
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    function isFocusable(element) {
+      return element.matches("a[href], button, input, select, textarea, summary, [tabindex]");
+    }
+
+    const items = [];
+
+    Array.from(document.body.querySelectorAll("*")).forEach((element) => {
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      const reasons = [];
+
+      if (element.hasAttribute("hidden")) reasons.push("hidden-attributt");
+      if (element.getAttribute("aria-hidden") === "true") reasons.push("aria-hidden");
+      if (style.display === "none") reasons.push("display:none");
+      if (style.visibility === "hidden" || style.visibility === "collapse") reasons.push(`visibility:${style.visibility}`);
+      if (Number(style.opacity) === 0) reasons.push("opacity:0");
+      if (style.clip !== "auto" || style.clipPath !== "none") reasons.push("clip/clip-path");
+      if (rect.width === 1 && rect.height === 1 && style.position === "absolute") reasons.push("typisk visuelt skjult 1x1");
+      if (rect.right < 0 || rect.bottom < 0 || rect.left > window.innerWidth + 5000 || rect.top > window.innerHeight + 5000) {
+        reasons.push("plassert utenfor synlig område");
+      }
+
+      if (!reasons.length) {
+        return;
+      }
+
+      items.push({
+        element: element.tagName.toLowerCase(),
+        selector: selectorFor(element),
+        text: normalized(element.innerText || element.textContent).slice(0, 120),
+        focusable: isFocusable(element) || Boolean(element.querySelector("a[href], button, input, select, textarea, summary, [tabindex]")),
+        reasons,
+      });
+    });
+
+    return {
+      total: items.length,
+      items: items.slice(0, 120),
+      truncated: items.length > 120,
+    };
+  });
+}
+
+async function getCssFocusStyles(page) {
+  return page.evaluate(async () => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) return `#${CSS.escape(element.id)}`;
+      return element.tagName.toLowerCase();
+    }
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    }
+
+    function snapshot(element) {
+      const style = window.getComputedStyle(element);
+      return {
+        outlineStyle: style.outlineStyle,
+        outlineWidth: style.outlineWidth,
+        outlineColor: style.outlineColor,
+        boxShadow: style.boxShadow,
+        borderColor: style.borderColor,
+        backgroundColor: style.backgroundColor,
+      };
+    }
+
+    function changed(before, after) {
+      return Object.keys(before).filter((key) => before[key] !== after[key]);
+    }
+
+    const elements = Array.from(document.querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex]"))
+      .filter((element) => visible(element) && !element.disabled)
+      .slice(0, 80);
+    const items = [];
+
+    for (const element of elements) {
+      const before = snapshot(element);
+      element.focus({ preventScroll: true });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const after = snapshot(element);
+      const changedProperties = changed(before, after);
+      const outlineVisible = after.outlineStyle !== "none" && after.outlineWidth !== "0px";
+      const boxShadowVisible = after.boxShadow !== "none" && after.boxShadow !== before.boxShadow;
+      const borderChanged = after.borderColor !== before.borderColor;
+
+      items.push({
+        element: element.tagName.toLowerCase(),
+        selector: selectorFor(element),
+        text: normalized(element.innerText || element.value || element.getAttribute("aria-label") || element.textContent).slice(0, 100),
+        hasVisibleFocus: outlineVisible || boxShadowVisible || borderChanged,
+        changedProperties,
+        outline: `${after.outlineWidth} ${after.outlineStyle} ${after.outlineColor}`,
+        boxShadow: after.boxShadow,
+      });
+    }
+
+    const missing = items.filter((item) => !item.hasVisibleFocus).length;
+
+    return {
+      checked: items.length,
+      missing,
+      items,
+      truncated: document.querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex]").length > 80,
+    };
+  });
+}
+
+async function getCssResponsive(page, url) {
+  const viewports = [
+    { name: "mobil smal", width: 320, height: 800 },
+    { name: "mobil", width: 390, height: 844 },
+    { name: "nettbrett", width: 768, height: 900 },
+    { name: "desktop", width: 1366, height: 900 },
+  ];
+  const results = [];
+
+  for (const viewport of viewports) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await gotoForAnalysis(page, url, 30000);
+    results.push(await page.evaluate((viewportName) => {
+      function normalized(text) {
+        return String(text || "").replace(/\s+/g, " ").trim();
+      }
+
+      const overflowing = Array.from(document.querySelectorAll("body *"))
+        .map((element) => {
+          const rect = element.getBoundingClientRect();
+          return {
+            element: element.tagName.toLowerCase(),
+            selector: element.id ? `#${CSS.escape(element.id)}` : element.tagName.toLowerCase(),
+            text: normalized(element.innerText || element.textContent).slice(0, 80),
+            left: Math.round(rect.left),
+            right: Math.round(rect.right),
+            width: Math.round(rect.width),
+          };
+        })
+        .filter((item) => item.width > 0 && (item.right > window.innerWidth + 1 || item.left < -1))
+        .slice(0, 30);
+
+      return {
+        name: viewportName,
+        width: window.innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        bodyWidth: document.body.scrollWidth,
+        horizontalScroll: document.documentElement.scrollWidth > window.innerWidth + 1 || document.body.scrollWidth > window.innerWidth + 1,
+        overflowing,
+      };
+    }, viewport.name));
+  }
+
+  return { viewports: results };
+}
+
+async function getCssColors(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function colorName(value) {
+      const match = String(value).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+      if (!match) return value;
+      const red = Number(match[1]);
+      const green = Number(match[2]);
+      const blue = Number(match[3]);
+      const colors = [
+        ["svart", 0, 0, 0], ["hvit", 255, 255, 255], ["grå", 128, 128, 128],
+        ["rød", 220, 20, 60], ["oransje", 255, 140, 0], ["gul", 255, 215, 0],
+        ["grønn", 34, 139, 34], ["turkis", 64, 224, 208], ["blå", 30, 144, 255],
+        ["marineblå", 0, 31, 63], ["lilla", 128, 0, 128], ["rosa", 255, 105, 180],
+        ["brun", 139, 69, 19], ["beige", 245, 245, 220],
+      ];
+      let best = colors[0];
+      let bestDistance = Infinity;
+
+      colors.forEach((color) => {
+        const distance = (red - color[1]) ** 2 + (green - color[2]) ** 2 + (blue - color[3]) ** 2;
+        if (distance < bestDistance) {
+          best = color;
+          bestDistance = distance;
+        }
+      });
+
+      return `${value} (${best[0]})`;
+    }
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    }
+
+    const map = new Map();
+
+    Array.from(document.body.querySelectorAll("*"))
+      .filter((element) => visible(element) && normalized(element.innerText || element.textContent))
+      .forEach((element) => {
+        const style = window.getComputedStyle(element);
+        const key = `${style.color}|${style.backgroundColor}`;
+
+        if (!map.has(key)) {
+          map.set(key, {
+            color: colorName(style.color),
+            backgroundColor: colorName(style.backgroundColor),
+            count: 0,
+            examples: [],
+          });
+        }
+
+        const item = map.get(key);
+        item.count += 1;
+
+        if (item.examples.length < 3) {
+          item.examples.push(`${element.tagName.toLowerCase()}: ${normalized(element.innerText || element.textContent).slice(0, 60)}`);
+        }
+      });
+
+    return Array.from(map.values()).sort((a, b) => b.count - a.count).slice(0, 80);
+  });
+}
+
+async function getCssVariables(page) {
+  return page.evaluate(() => {
+    const variables = new Map();
+
+    Array.from(document.styleSheets).forEach((sheet) => {
+      let rules = [];
+
+      try {
+        rules = Array.from(sheet.cssRules || []);
+      } catch {
+        return;
+      }
+
+      rules.forEach((rule) => {
+        const style = rule.style;
+
+        if (!style) {
+          return;
+        }
+
+        Array.from(style).forEach((property) => {
+          if (!property.startsWith("--")) {
+            return;
+          }
+
+          if (!variables.has(property)) {
+            variables.set(property, {
+              name: property,
+              value: style.getPropertyValue(property).trim(),
+              count: 0,
+              selectors: [],
+            });
+          }
+
+          const item = variables.get(property);
+          item.count += 1;
+
+          if (item.selectors.length < 5 && rule.selectorText) {
+            item.selectors.push(rule.selectorText);
+          }
+        });
+      });
+    });
+
+    return Array.from(variables.values()).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 200);
+  });
+}
+
+async function getCssElement(page, selector) {
+  return page.evaluate((selectorValue) => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    let matches;
+
+    try {
+      matches = document.querySelectorAll(selectorValue);
+    } catch {
+      return {
+        selector: selectorValue,
+        count: 0,
+        items: [],
+        error: "Ugyldig CSS-selector.",
+      };
+    }
+
+    const elements = Array.from(matches).slice(0, 20);
+    const properties = [
+      "display", "position", "zIndex", "boxSizing", "width", "height", "margin", "padding",
+      "fontFamily", "fontSize", "fontWeight", "lineHeight", "color", "backgroundColor",
+      "border", "outline", "boxShadow", "overflow", "overflowX", "overflowY",
+      "visibility", "opacity", "clipPath",
+    ];
+
+    return {
+      selector: selectorValue,
+      count: matches.length,
+      items: elements.map((element) => {
+        const style = window.getComputedStyle(element);
+        const computed = {};
+
+        properties.forEach((property) => {
+          computed[property] = style[property];
+        });
+
+        return {
+          element: element.tagName.toLowerCase(),
+          id: element.id || "",
+          classes: typeof element.className === "string" ? element.className : "",
+          text: normalized(element.innerText || element.textContent).slice(0, 120),
+          computed,
+        };
+      }),
+    };
+  }, selector);
+}
+
 async function getWcag(page) {
   await page.addScriptTag({ content: axe.source });
 
@@ -3684,6 +4083,48 @@ const analyzers = {
     url,
     contrast: await getContrast(page),
   }),
+  css: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    css: await getCssOverview(page),
+  }),
+  csselement: async (page, url, options = {}) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cssElement: await getCssElement(page, options.selector || "body"),
+  }),
+  cssfarger: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cssColors: await getCssColors(page),
+  }),
+  cssfokusstil: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cssFocusStyles: await getCssFocusStyles(page),
+  }),
+  cssresponsiv: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cssResponsive: await getCssResponsive(page, url),
+  }),
+  cssskjult: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cssHidden: await getCssHidden(page),
+  }),
+  cssvariabler: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cssVariables: await getCssVariables(page),
+  }),
   links: async (page, url) => {
     const result = await getLinks(page);
 
@@ -3859,6 +4300,7 @@ app.get("/health", (req, res) => {
 app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
+  const selector = String(req.query.selector || "").trim();
 
   if (command === "describe") {
     if (!requestedUrl) {
@@ -3968,7 +4410,7 @@ app.get("/analyze", async (req, res) => {
       return;
     }
 
-    const result = await analyzePage(url, (page) => analyzers[command](page, url));
+    const result = await analyzePage(url, (page) => analyzers[command](page, url, { selector }));
 
     res.json(result);
   } catch (error) {
