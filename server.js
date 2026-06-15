@@ -7,12 +7,15 @@ import axe from "axe-core";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const allowPrivateUrls = process.env.WEBQUEST_ALLOW_PRIVATE_URLS === "true";
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
 
 let browserPromise;
+let persistentContextPromise;
+const crcTable = createCrcTable();
 
 function getBrowser() {
   if (!browserPromise) {
@@ -79,8 +82,12 @@ async function validatePublicUrl(url) {
     throw new Error("URL-en må starte med http eller https.");
   }
 
-  if (parsed.hostname === "localhost") {
+  if (!allowPrivateUrls && parsed.hostname === "localhost") {
     throw new Error("Lokale adresser kan ikke analyseres.");
+  }
+
+  if (allowPrivateUrls) {
+    return parsed.href;
   }
 
   const addresses = await dns.lookup(parsed.hostname, { all: true });
@@ -102,10 +109,38 @@ function setCorsHeaders(req, res) {
   if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
     res.set("Access-Control-Allow-Origin", origin);
     res.set("Vary", "Origin");
+    res.set("Access-Control-Expose-Headers", "Content-Disposition");
   }
 }
 
 async function analyzePage(url, analyzer) {
+  if (process.env.WEBQUEST_USE_PERSISTENT_BROWSER === "true") {
+    const context = await getPersistentContext();
+    let page;
+
+    try {
+      page = await context.newPage();
+      await gotoForAnalysis(page, url, 90000);
+
+      return await withPageInfo(page, analyzer);
+    } catch (error) {
+      if (isClosedBrowserError(error)) {
+        await resetPersistentContext();
+        const retryContext = await getPersistentContext();
+        page = await retryContext.newPage();
+        await gotoForAnalysis(page, url, 90000);
+
+        return await withPageInfo(page, analyzer);
+      }
+
+      throw error;
+    } finally {
+      if (page) {
+        await page.close().catch(() => {});
+      }
+    }
+  }
+
   const browser = await getBrowser();
   const context = await browser.newContext({
     bypassCSP: true,
@@ -116,14 +151,119 @@ async function analyzePage(url, analyzer) {
   const page = await context.newPage();
 
   try {
-    await page.goto(url, {
-      waitUntil: "networkidle",
-      timeout: 30000,
-    });
+    await gotoForAnalysis(page, url, 30000);
 
-    return await analyzer(page);
+    return await withPageInfo(page, analyzer);
   } finally {
     await context.close();
+  }
+}
+
+async function withPageInfo(page, analyzer) {
+  const result = await analyzer(page);
+
+  if (result && typeof result === "object" && !Array.isArray(result)) {
+    return {
+      ...result,
+      pageInfo: await getPageInfo(page),
+    };
+  }
+
+  return result;
+}
+
+async function getPageInfo(page) {
+  return page.evaluate(() => {
+    const text = String(document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 300);
+
+    return {
+      title: document.title || "",
+      finalUrl: location.href,
+      bodyTextStart: text,
+      headingCount: document.querySelectorAll("h1, h2, h3, h4, h5, h6").length,
+    };
+  }).catch(() => ({
+    title: "",
+    finalUrl: page.url(),
+    bodyTextStart: "",
+    headingCount: 0,
+  }));
+}
+
+async function gotoForAnalysis(page, url, timeout) {
+  await page.goto(url, {
+    waitUntil: "domcontentloaded",
+    timeout,
+  });
+
+  await page.waitForLoadState("load", { timeout: Math.min(timeout, 15000) }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await waitForAutomaticLogin(page, url, timeout);
+}
+
+async function waitForAutomaticLogin(page, originalUrl, timeout) {
+  const originalHost = new URL(originalUrl).hostname;
+  const loginPattern = /login\.microsoftonline\.com|login\.windows\.net|oauth2|authorize/i;
+  const currentUrl = page.url();
+  const title = await page.title().catch(() => "");
+
+  if (!loginPattern.test(currentUrl) && !/logg på|sign in|sign-in/i.test(title)) {
+    return;
+  }
+
+  await page.waitForURL((nextUrl) => {
+    try {
+      const parsed = new URL(String(nextUrl));
+      return parsed.hostname === originalHost || parsed.hostname.endsWith(`.${originalHost}`);
+    } catch {
+      return false;
+    }
+  }, { timeout: Math.min(timeout, 45000) }).catch(() => {});
+
+  await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(2000);
+}
+
+function isClosedBrowserError(error) {
+  const message = String(error && error.message ? error.message : error || "");
+  return /Target page, context or browser has been closed|Browser has been closed|Context closed/i.test(message);
+}
+
+async function getPersistentContext() {
+  if (!persistentContextPromise) {
+    const options = {
+      bypassCSP: true,
+      headless: false,
+      locale: "nb-NO",
+      userAgent:
+        "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+    };
+    const browserChannel = process.env.WEBQUEST_BROWSER_CHANNEL;
+
+    if (browserChannel) {
+      options.channel = browserChannel;
+    }
+
+    persistentContextPromise = chromium.launchPersistentContext(
+      process.env.WEBQUEST_BROWSER_PROFILE || "./webquest-browser-profile",
+      options
+    );
+  }
+
+  return persistentContextPromise;
+}
+
+async function resetPersistentContext() {
+  if (!persistentContextPromise) {
+    return;
+  }
+
+  try {
+    const context = await persistentContextPromise;
+    await context.close();
+  } catch {
+  } finally {
+    persistentContextPromise = null;
   }
 }
 
@@ -255,6 +395,8 @@ async function describeImage(url) {
 }
 
 async function getHeadings(page) {
+  await page.waitForSelector("h1, h2, h3, h4, h5, h6", { timeout: 10000 }).catch(() => {});
+
   return page.locator("h1, h2, h3, h4, h5, h6").evaluateAll((headings) =>
     headings
       .map((heading) => {
@@ -2641,6 +2783,204 @@ async function getDom(page) {
   return page.content();
 }
 
+function createCrcTable() {
+  const table = new Uint32Array(256);
+
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+
+    for (let bit = 0; bit < 8; bit += 1) {
+      value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+
+    table[index] = value >>> 0;
+  }
+
+  return table;
+}
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+
+  for (const byte of buffer) {
+    crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date = new Date()) {
+  const dosTime =
+    (date.getHours() << 11) |
+    (date.getMinutes() << 5) |
+    Math.floor(date.getSeconds() / 2);
+  const dosDate =
+    ((date.getFullYear() - 1980) << 9) |
+    ((date.getMonth() + 1) << 5) |
+    date.getDate();
+
+  return { dosTime, dosDate };
+}
+
+function createZip(files) {
+  const localParts = [];
+  const centralParts = [];
+  let offset = 0;
+  const { dosTime, dosDate } = dosDateTime();
+
+  files.forEach((file) => {
+    const name = Buffer.from(file.name, "utf8");
+    const data = Buffer.isBuffer(file.data) ? file.data : Buffer.from(file.data);
+    const crc = crc32(data);
+    const local = Buffer.alloc(30);
+
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(0x0800, 6);
+    local.writeUInt16LE(0, 8);
+    local.writeUInt16LE(dosTime, 10);
+    local.writeUInt16LE(dosDate, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(data.length, 22);
+    local.writeUInt16LE(name.length, 26);
+    local.writeUInt16LE(0, 28);
+    localParts.push(local, name, data);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(0x0800, 8);
+    central.writeUInt16LE(0, 10);
+    central.writeUInt16LE(dosTime, 12);
+    central.writeUInt16LE(dosDate, 14);
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(data.length, 20);
+    central.writeUInt32LE(data.length, 24);
+    central.writeUInt16LE(name.length, 28);
+    central.writeUInt16LE(0, 30);
+    central.writeUInt16LE(0, 32);
+    central.writeUInt16LE(0, 34);
+    central.writeUInt16LE(0, 36);
+    central.writeUInt32LE(0, 38);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, name);
+
+    offset += local.length + name.length + data.length;
+  });
+
+  const centralDirectory = Buffer.concat(centralParts);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(0, 4);
+  end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(centralDirectory.length, 12);
+  end.writeUInt32LE(offset, 16);
+  end.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, centralDirectory, end]);
+}
+
+function slugPart(text, fallback = "side") {
+  const slug = String(text || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/æ/g, "ae")
+    .replace(/ø/g, "o")
+    .replace(/å/g, "a")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+
+  return slug || fallback;
+}
+
+function timestampPart(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+
+  return [
+    date.getFullYear(),
+    pad(date.getMonth() + 1),
+    pad(date.getDate()),
+    "-",
+    pad(date.getHours()),
+    pad(date.getMinutes()),
+    pad(date.getSeconds()),
+  ].join("");
+}
+
+async function createSaveArchive(url) {
+  const browser = await getBrowser();
+  const context = await browser.newContext({
+    bypassCSP: true,
+    locale: "nb-NO",
+    userAgent:
+      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+  });
+  const page = await context.newPage();
+
+  try {
+    await gotoForAnalysis(page, url, 45000);
+    await page.emulateMedia({ media: "screen" }).catch(() => {});
+
+    const title = await page.title().catch(() => "");
+    const finalUrl = page.url();
+    const host = new URL(finalUrl).hostname.replace(/^www\./, "");
+    const baseName = `${timestampPart()}-${slugPart(host)}-${slugPart(title, "uten-tittel")}`.slice(0, 140);
+    const session = await context.newCDPSession(page);
+    const snapshot = await session.send("Page.captureSnapshot", { format: "mhtml" });
+    const pdfOptions = {
+      format: "A4",
+      printBackground: true,
+      preferCSSPageSize: true,
+      tagged: true,
+      outline: true,
+      margin: {
+        top: "12mm",
+        right: "12mm",
+        bottom: "12mm",
+        left: "12mm",
+      },
+    };
+    let pdf;
+
+    try {
+      pdf = await page.pdf(pdfOptions);
+    } catch {
+      pdf = await page.pdf({
+        format: "A4",
+        printBackground: true,
+        preferCSSPageSize: true,
+        margin: pdfOptions.margin,
+      });
+    }
+
+    const info = [
+      `URL: ${url}`,
+      `Faktisk URL: ${finalUrl}`,
+      `Tittel: ${title || "mangler"}`,
+      "MHTML er en arkivversjon av siden.",
+      "PDF er laget med Chromium. Tagget PDF forsøkes der Chromium/Playwright støtter det.",
+    ].join("\r\n");
+    const zip = createZip([
+      { name: `${baseName}.mht`, data: Buffer.from(snapshot.data || "", "utf8") },
+      { name: `${baseName}.pdf`, data: Buffer.from(pdf) },
+      { name: `${baseName}-info.txt`, data: Buffer.from(info, "utf8") },
+    ]);
+
+    return {
+      filename: `${baseName}.zip`,
+      zip,
+    };
+  } finally {
+    await context.close();
+  }
+}
+
 async function getScreenReaderReport(page, mode = "reader") {
   return page.evaluate((reportMode) => {
     const maxLines = 900;
@@ -3379,6 +3719,32 @@ app.get("/analyze", async (req, res) => {
     return;
   }
 
+  if (command === "save") {
+    if (!requestedUrl) {
+      res.status(400).json({
+        ok: false,
+        error: 'Du må angi en URL eller velge en standard URL med kommandoen "Velg URL".',
+      });
+      return;
+    }
+
+    try {
+      const url = await validatePublicUrl(requestedUrl);
+      const archive = await createSaveArchive(url);
+
+      res.set("Content-Type", "application/zip");
+      res.set("Content-Disposition", `attachment; filename="${archive.filename}"`);
+      res.send(archive.zip);
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error.message || "Jeg fikk ikke lagret siden.",
+      });
+    }
+
+    return;
+  }
+
   if (!analyzers[command]) {
     res.status(400).json({ ok: false, error: "Ukjent analysekommando." });
     return;
@@ -3421,6 +3787,11 @@ app.listen(port, () => {
 });
 
 process.on("SIGTERM", async () => {
+  if (persistentContextPromise) {
+    const context = await persistentContextPromise;
+    await context.close();
+  }
+
   if (browserPromise) {
     const browser = await browserPromise;
     await browser.close();
