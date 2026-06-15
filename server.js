@@ -2900,17 +2900,19 @@ function slugPart(text, fallback = "side") {
 }
 
 function timestampPart(date = new Date()) {
-  const pad = (value) => String(value).padStart(2, "0");
+  const parts = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Oslo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const value = (type) => parts.find((part) => part.type === type)?.value || "00";
 
-  return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    "-",
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds()),
-  ].join("");
+  return `${value("year")}${value("month")}${value("day")}-${value("hour")}${value("minute")}${value("second")}`;
 }
 
 async function createSaveArchive(url) {
