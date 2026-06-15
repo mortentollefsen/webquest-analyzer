@@ -139,55 +139,71 @@ function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden."
 
 async function checkReachableUrl(url) {
   const validatedUrl = await validatePublicUrl(url);
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  let lastError = null;
 
-  try {
-    let response = await fetch(validatedUrl, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-      },
-    });
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20000);
+    const method = attempt < 3 ? "HEAD" : "GET";
 
-    if ([405, 501].includes(response.status)) {
-      response = await fetch(validatedUrl, {
-        method: "GET",
+    try {
+      let response = await fetch(validatedUrl, {
+        method,
         redirect: "follow",
         signal: controller.signal,
         headers: {
           "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
         },
       });
-    }
 
-    if (response.status >= 400) {
+      if ([405, 501].includes(response.status) && method === "HEAD") {
+        response = await fetch(validatedUrl, {
+          method: "GET",
+          redirect: "follow",
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+          },
+        });
+      }
+
+      if (response.status >= 500 && attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+        continue;
+      }
+
+      if (response.status >= 400) {
+        return {
+          ok: false,
+          url: response.url || validatedUrl,
+          status: response.status,
+          statusText: response.statusText,
+          error: `URL-en kan ikke nås. Serveren svarte ${httpStatusText(response.status, response.statusText)}.`,
+        };
+      }
+
       return {
-        ok: false,
+        ok: true,
         url: response.url || validatedUrl,
         status: response.status,
         statusText: response.statusText,
-        error: `URL-en kan ikke nås. Serveren svarte ${httpStatusText(response.status, response.statusText)}.`,
       };
-    }
+    } catch (error) {
+      lastError = error;
 
-    return {
-      ok: true,
-      url: response.url || validatedUrl,
-      status: response.status,
-      statusText: response.statusText,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      url: validatedUrl,
-      error: friendlyErrorMessage(error, "URL-en kan ikke nås."),
-    };
-  } finally {
-    clearTimeout(timeout);
+      if (attempt < 3) {
+        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
   }
+
+  return {
+    ok: false,
+    url: validatedUrl,
+    error: friendlyErrorMessage(lastError, "URL-en kan ikke nås."),
+  };
 }
 
 function setCorsHeaders(req, res) {
