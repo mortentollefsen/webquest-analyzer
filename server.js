@@ -2132,6 +2132,225 @@ async function getTitleInfo(page) {
   });
 }
 
+async function getMetaInfo(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function metaContent(selector) {
+      return normalized(document.querySelector(selector)?.getAttribute("content") || "");
+    }
+
+    function linkHref(selector) {
+      return document.querySelector(selector)?.href || document.querySelector(selector)?.getAttribute("href") || "";
+    }
+
+    function collectMeta(prefixSelector) {
+      return Array.from(document.querySelectorAll(prefixSelector))
+        .map((meta) => ({
+          name: meta.getAttribute("property") || meta.getAttribute("name") || "",
+          content: normalized(meta.getAttribute("content") || ""),
+        }))
+        .filter((meta) => meta.name || meta.content);
+    }
+
+    const title = normalized(document.title);
+    const description = metaContent("meta[name='description' i]");
+    const viewport = metaContent("meta[name='viewport' i]");
+    const robots = metaContent("meta[name='robots' i]");
+    const canonical = linkHref("link[rel~='canonical']");
+    const lang = normalized(document.documentElement.getAttribute("lang") || "");
+    const charset = document.characterSet || "";
+    const openGraph = collectMeta("meta[property^='og:' i]");
+    const twitter = collectMeta("meta[name^='twitter:' i]");
+    const favicons = Array.from(document.querySelectorAll("link[rel~='icon'], link[rel='shortcut icon' i], link[rel='apple-touch-icon' i]"))
+      .map((link) => ({
+        rel: link.getAttribute("rel") || "",
+        href: link.href || link.getAttribute("href") || "",
+        sizes: link.getAttribute("sizes") || "",
+        type: link.getAttribute("type") || "",
+      }))
+      .filter((icon) => icon.href);
+    const issues = [];
+
+    if (!title) issues.push("Dokumenttittel mangler.");
+    if (title.length > 70) issues.push("Dokumenttittel er lang.");
+    if (!description) issues.push("Meta description mangler.");
+    if (description.length > 170) issues.push("Meta description er lang.");
+    if (!viewport) issues.push("Viewport-meta mangler.");
+    if (!lang) issues.push("Språk mangler på html-elementet.");
+    if (!canonical) issues.push("Canonical-lenke mangler.");
+    if (!openGraph.some((meta) => meta.name === "og:title")) issues.push("Open Graph-title mangler.");
+    if (!openGraph.some((meta) => meta.name === "og:description")) issues.push("Open Graph-description mangler.");
+    if (!openGraph.some((meta) => meta.name === "og:image")) issues.push("Open Graph-image mangler.");
+    if (!favicons.length) issues.push("Favicon mangler.");
+
+    return {
+      title,
+      titleLength: title.length,
+      description,
+      descriptionLength: description.length,
+      lang,
+      charset,
+      viewport,
+      robots,
+      canonical,
+      openGraph,
+      twitter,
+      favicons,
+      issues,
+    };
+  });
+}
+
+async function getReadability(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    function isHidden(element) {
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          node.getAttribute("aria-hidden") === "true"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    function visibleText(element) {
+      if (!element || isHidden(element)) {
+        return "";
+      }
+
+      return normalized(element.innerText || element.textContent || "");
+    }
+
+    const bodyText = visibleText(document.body);
+    const words = bodyText.match(/\b[\p{L}\p{N}][\p{L}\p{N}'’-]*\b/gu) || [];
+    const sentences = bodyText
+      .split(/[.!?]+(?:\s|$)/)
+      .map(normalized)
+      .filter((sentence) => sentence.split(/\s+/).filter(Boolean).length > 3);
+    const paragraphs = Array.from(document.querySelectorAll("p, li"))
+      .map((element) => ({
+        element,
+        text: visibleText(element),
+      }))
+      .filter((item) => item.text);
+    const longParagraphs = paragraphs
+      .map((item) => ({
+        tag: item.element.tagName.toLowerCase(),
+        words: (item.text.match(/\b[\p{L}\p{N}][\p{L}\p{N}'’-]*\b/gu) || []).length,
+        text: item.text.slice(0, 240),
+        selector: selectorFor(item.element),
+      }))
+      .filter((item) => item.words >= 90)
+      .slice(0, 20);
+    const longSentences = sentences
+      .map((sentence) => ({
+        words: sentence.split(/\s+/).filter(Boolean).length,
+        text: sentence.slice(0, 240),
+      }))
+      .filter((sentence) => sentence.words >= 30)
+      .slice(0, 20);
+    const weakLinkPatterns = /^(les mer|mer|her|klikk her|trykk her|read more|more)$/i;
+    const weakLinks = Array.from(document.querySelectorAll("a[href]"))
+      .map((link) => ({
+        text: visibleText(link),
+        href: link.href || link.getAttribute("href") || "",
+        selector: selectorFor(link),
+      }))
+      .filter((link) => !link.text || weakLinkPatterns.test(link.text))
+      .slice(0, 30);
+    const uppercaseTexts = Array.from(document.querySelectorAll("h1, h2, h3, p, li, a, button"))
+      .map((element) => ({
+        tag: element.tagName.toLowerCase(),
+        text: visibleText(element),
+        selector: selectorFor(element),
+      }))
+      .filter((item) => item.text.length >= 18 && item.text === item.text.toLocaleUpperCase("nb-NO") && /[A-ZÆØÅ]{4}/.test(item.text))
+      .slice(0, 20);
+    const languageChanges = Array.from(document.querySelectorAll("[lang]"))
+      .filter((element) => element !== document.documentElement)
+      .map((element) => ({
+        tag: element.tagName.toLowerCase(),
+        lang: element.getAttribute("lang") || "",
+        text: visibleText(element).slice(0, 160),
+        selector: selectorFor(element),
+      }))
+      .slice(0, 30);
+    const issues = [];
+
+    if (!document.documentElement.getAttribute("lang")) {
+      issues.push("Siden mangler språk på html-elementet.");
+    }
+
+    if (longParagraphs.length) {
+      issues.push("Noen avsnitt eller listepunkter er lange.");
+    }
+
+    if (longSentences.length) {
+      issues.push("Noen setninger er lange.");
+    }
+
+    if (weakLinks.length) {
+      issues.push("Noen lenker har svak eller manglende lenketekst.");
+    }
+
+    if (uppercaseTexts.length) {
+      issues.push("Noe tekst er skrevet med store bokstaver.");
+    }
+
+    return {
+      wordCount: words.length,
+      sentenceCount: sentences.length,
+      paragraphCount: paragraphs.length,
+      averageWordsPerSentence: sentences.length ? Math.round(words.length / sentences.length) : 0,
+      longParagraphs,
+      longSentences,
+      weakLinks,
+      uppercaseTexts,
+      languageChanges,
+      issues,
+    };
+  });
+}
+
 async function getFocus(page) {
   return page.evaluate(collectAccessibilityData, "focus");
 
@@ -4258,6 +4477,18 @@ const analyzers = {
     engine: "playwright",
     url,
     titleInfo: await getTitleInfo(page),
+  }),
+  meta: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    meta: await getMetaInfo(page),
+  }),
+  readability: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    readability: await getReadability(page),
   }),
   focus: async (page, url) => ({
     ok: true,
