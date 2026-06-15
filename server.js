@@ -3,11 +3,14 @@ import { chromium } from "playwright";
 import dns from "node:dns/promises";
 import net from "node:net";
 import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import axe from "axe-core";
 import { HtmlValidate } from "html-validate";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
+const statisticsFile = process.env.WEBQUEST_STATS_FILE || path.join(process.cwd(), "webquest-statistics.json");
 const allowPrivateUrls = process.env.WEBQUEST_ALLOW_PRIVATE_URLS === "true";
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
@@ -16,6 +19,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 
 let browserPromise;
 let persistentContextPromise;
+let statisticsWriteQueue = Promise.resolve();
 const crcTable = createCrcTable();
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
@@ -105,6 +109,69 @@ async function validatePublicUrl(url) {
 
 function httpStatusText(status, statusText = "") {
   return `${status}${statusText ? ` ${statusText}` : ""}`;
+}
+
+async function readStatistics() {
+  try {
+    const raw = await fs.readFile(statisticsFile, "utf8");
+    const parsed = JSON.parse(raw);
+
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed
+      : { commands: {}, total: 0, updatedAt: "" };
+  } catch {
+    return { commands: {}, total: 0, updatedAt: "" };
+  }
+}
+
+async function writeStatistics(statistics) {
+  const directory = path.dirname(statisticsFile);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(statisticsFile, JSON.stringify(statistics, null, 2), "utf8");
+}
+
+async function recordStatistic(commandName) {
+  const name = String(commandName || "").trim().slice(0, 80);
+
+  if (!name) {
+    throw new Error("Kommandonavn mangler.");
+  }
+
+  const update = statisticsWriteQueue.then(async () => {
+    const statistics = await readStatistics();
+
+    statistics.commands = statistics.commands && typeof statistics.commands === "object"
+      ? statistics.commands
+      : {};
+    statistics.commands[name] = (Number(statistics.commands[name]) || 0) + 1;
+    statistics.total = Object.values(statistics.commands)
+      .reduce((sum, count) => sum + (Number(count) || 0), 0);
+    statistics.updatedAt = new Date().toISOString();
+
+    await writeStatistics(statistics);
+    return statistics;
+  });
+
+  statisticsWriteQueue = update.catch(() => {});
+  return update;
+}
+
+function publicStatistics(statistics) {
+  const commands = statistics.commands && typeof statistics.commands === "object"
+    ? statistics.commands
+    : {};
+  const items = Object.entries(commands)
+    .map(([name, count]) => ({ name, count: Number(count) || 0 }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name, "nb-NO"));
+  const total = items.reduce((sum, item) => sum + item.count, 0);
+
+  return {
+    total,
+    uniqueCommands: items.filter((item) => item.count > 0).length,
+    updatedAt: statistics.updatedAt || "",
+    storage: "server",
+    items,
+  };
 }
 
 function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden.") {
@@ -4685,6 +4752,42 @@ app.get("/analyze", async (req, res) => {
       res.status(500).json({
         ok: false,
         error: friendlyErrorMessage(error, "URL-en kan ikke nås."),
+      });
+    }
+
+    return;
+  }
+
+  if (command === "recordstat") {
+    const statCommand = String(req.query.statcommand || "").trim();
+
+    try {
+      await recordStatistic(statCommand);
+      res.json({
+        ok: true,
+        engine: "webquest-statistics",
+      });
+    } catch (error) {
+      res.status(400).json({
+        ok: false,
+        error: error.message || "Statistikken kunne ikke lagres.",
+      });
+    }
+
+    return;
+  }
+
+  if (command === "statistics") {
+    try {
+      res.json({
+        ok: true,
+        engine: "webquest-statistics",
+        statistics: publicStatistics(await readStatistics()),
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: "Statistikken kunne ikke hentes.",
       });
     }
 
