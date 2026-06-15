@@ -20,6 +20,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 let browserPromise;
 let persistentContextPromise;
 let statisticsWriteQueue = Promise.resolve();
+const activeWindows = new Map();
 const crcTable = createCrcTable();
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
@@ -170,8 +171,33 @@ function publicStatistics(statistics) {
     uniqueCommands: items.filter((item) => item.count > 0).length,
     updatedAt: statistics.updatedAt || "",
     storage: "server",
+    activeWindows: countActiveWindows(),
     items,
   };
+}
+
+function countActiveWindows() {
+  const now = Date.now();
+  const activeAfter = now - 120000;
+
+  for (const [id, lastSeen] of activeWindows.entries()) {
+    if (lastSeen < activeAfter) {
+      activeWindows.delete(id);
+    }
+  }
+
+  return activeWindows.size;
+}
+
+function recordActiveWindow(windowId) {
+  const id = String(windowId || "").trim().slice(0, 120);
+
+  if (!id) {
+    throw new Error("Vindus-ID mangler.");
+  }
+
+  activeWindows.set(id, Date.now());
+  return countActiveWindows();
 }
 
 function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden.") {
@@ -4788,6 +4814,23 @@ app.get("/analyze", async (req, res) => {
       res.status(500).json({
         ok: false,
         error: "Statistikken kunne ikke hentes.",
+      });
+    }
+
+    return;
+  }
+
+  if (command === "heartbeat") {
+    try {
+      res.json({
+        ok: true,
+        engine: "webquest-active-windows",
+        activeWindows: recordActiveWindow(req.query.windowid),
+      });
+    } catch (error) {
+      res.status(400).json({
+        ok: false,
+        error: error.message || "Aktive vinduer kunne ikke oppdateres.",
       });
     }
 
