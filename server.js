@@ -99,6 +99,97 @@ async function validatePublicUrl(url) {
   return parsed.href;
 }
 
+function httpStatusText(status, statusText = "") {
+  return `${status}${statusText ? ` ${statusText}` : ""}`;
+}
+
+function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden.") {
+  const message = String(error?.message || error || "");
+
+  if (/URL-en/i.test(message)) {
+    return message;
+  }
+
+  if (/ENOTFOUND|getaddrinfo|ERR_NAME_NOT_RESOLVED|Name or service not known/i.test(message)) {
+    return "URL-en kan ikke nås. Domenet finnes ikke, eller DNS-oppslag feilet.";
+  }
+
+  if (/ETIMEDOUT|timed out|Timeout|ERR_CONNECTION_TIMED_OUT/i.test(message)) {
+    return "URL-en kan ikke nås. Siden svarte ikke innen tidsfristen.";
+  }
+
+  if (/ECONNREFUSED|ERR_CONNECTION_REFUSED/i.test(message)) {
+    return "URL-en kan ikke nås. Serveren avviste tilkoblingen.";
+  }
+
+  if (/ECONNRESET|ERR_CONNECTION_RESET/i.test(message)) {
+    return "URL-en kan ikke nås. Tilkoblingen ble brutt.";
+  }
+
+  if (/ERR_CERT|certificate|SSL|TLS/i.test(message)) {
+    return "URL-en kan ikke nås på grunn av sertifikatfeil.";
+  }
+
+  if (/ERR_TOO_MANY_REDIRECTS|redirect/i.test(message)) {
+    return "URL-en kan ikke nås. Siden videresender for mange ganger.";
+  }
+
+  return fallback;
+}
+
+async function checkReachableUrl(url) {
+  const validatedUrl = await validatePublicUrl(url);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    let response = await fetch(validatedUrl, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+      },
+    });
+
+    if ([405, 501].includes(response.status)) {
+      response = await fetch(validatedUrl, {
+        method: "GET",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+        },
+      });
+    }
+
+    if (response.status >= 400) {
+      return {
+        ok: false,
+        url: response.url || validatedUrl,
+        status: response.status,
+        statusText: response.statusText,
+        error: `URL-en kan ikke nås. Serveren svarte ${httpStatusText(response.status, response.statusText)}.`,
+      };
+    }
+
+    return {
+      ok: true,
+      url: response.url || validatedUrl,
+      status: response.status,
+      statusText: response.statusText,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      url: validatedUrl,
+      error: friendlyErrorMessage(error, "URL-en kan ikke nås."),
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function setCorsHeaders(req, res) {
   const origin = req.get("origin");
 
@@ -191,10 +282,14 @@ async function getPageInfo(page) {
 }
 
 async function gotoForAnalysis(page, url, timeout) {
-  await page.goto(url, {
+  const response = await page.goto(url, {
     waitUntil: "domcontentloaded",
     timeout,
   });
+
+  if (response && response.status() >= 400) {
+    throw new Error(`URL-en kan ikke nås. Serveren svarte ${httpStatusText(response.status(), response.statusText())}.`);
+  }
 
   await page.waitForLoadState("load", { timeout: Math.min(timeout, 15000) }).catch(() => {});
   await page.waitForTimeout(1200);
@@ -3714,7 +3809,39 @@ app.get("/analyze", async (req, res) => {
     } catch (error) {
       res.status(500).json({
         ok: false,
-        error: error.message || "Jeg fikk ikke beskrevet bildet.",
+        error: friendlyErrorMessage(error, error.message || "Jeg fikk ikke beskrevet bildet."),
+      });
+    }
+
+    return;
+  }
+
+  if (command === "checkurl") {
+    if (!requestedUrl) {
+      res.status(400).json({
+        ok: false,
+        error: "Skriv en URL etter Velg.",
+      });
+      return;
+    }
+
+    try {
+      const result = await checkReachableUrl(requestedUrl);
+
+      if (!result.ok) {
+        res.status(400).json(result);
+        return;
+      }
+
+      res.json({
+        ok: true,
+        engine: "fetch",
+        ...result,
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: friendlyErrorMessage(error, "URL-en kan ikke nås."),
       });
     }
 
@@ -3740,7 +3867,7 @@ app.get("/analyze", async (req, res) => {
     } catch (error) {
       res.status(500).json({
         ok: false,
-        error: error.message || "Jeg fikk ikke lagret siden.",
+        error: friendlyErrorMessage(error, error.message || "Jeg fikk ikke lagret siden."),
       });
     }
 
@@ -3779,7 +3906,7 @@ app.get("/analyze", async (req, res) => {
   } catch (error) {
     res.status(500).json({
       ok: false,
-      error: error.message || "Jeg fikk ikke analysert siden.",
+      error: friendlyErrorMessage(error, "Jeg fikk ikke analysert siden."),
     });
   }
 });
