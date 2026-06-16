@@ -4129,6 +4129,103 @@ async function getSource(url) {
   return response.text();
 }
 
+function formatHtmlSource(source) {
+  const html = String(source || "").trim();
+
+  if (!html) {
+    return "";
+  }
+
+  const voidTags = new Set([
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+  ]);
+  const rawTextTags = new Set(["script", "style", "pre", "textarea"]);
+  const tokenPattern = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<!doctype[^>]*>|<\?[\s\S]*?\?>|<\/?[a-zA-Z][^>]*>/gi;
+  const lines = [];
+  let indent = 0;
+  let position = 0;
+  let rawTextTag = "";
+
+  const pushLine = (text, level = indent) => {
+    const value = String(text || "").trim();
+
+    if (value) {
+      lines.push(`${"  ".repeat(Math.max(0, level))}${value}`);
+    }
+  };
+
+  const pushText = (text) => {
+    const value = String(text || "").replace(/\s+/g, " ").trim();
+
+    if (value) {
+      pushLine(value);
+    }
+  };
+
+  for (const match of html.matchAll(tokenPattern)) {
+    const token = match[0];
+    const before = html.slice(position, match.index);
+
+    if (rawTextTag) {
+      const closingPattern = new RegExp(`^</${rawTextTag}\\s*>$`, "i");
+
+      if (closingPattern.test(token)) {
+        String(before || "")
+          .split(/\r?\n/)
+          .map((line) => line.trimEnd())
+          .filter((line) => line.trim())
+          .forEach((line) => lines.push(`${"  ".repeat(indent)}${line.trimStart()}`));
+        indent = Math.max(0, indent - 1);
+        pushLine(token);
+        rawTextTag = "";
+      }
+
+      position = match.index + token.length;
+      continue;
+    }
+
+    pushText(before);
+
+    const closing = /^<\//.test(token);
+    const tagMatch = token.match(/^<\/?\s*([a-zA-Z0-9:-]+)/);
+    const tagName = tagMatch ? tagMatch[1].toLowerCase() : "";
+    const selfClosing = /\/>$/.test(token) || voidTags.has(tagName) || /^<!|^<\?/.test(token);
+
+    if (closing) {
+      indent = Math.max(0, indent - 1);
+      pushLine(token);
+    } else {
+      pushLine(token);
+
+      if (!selfClosing) {
+        indent += 1;
+
+        if (rawTextTags.has(tagName)) {
+          rawTextTag = tagName;
+        }
+      }
+    }
+
+    position = match.index + token.length;
+  }
+
+  pushText(html.slice(position));
+  return lines.join("\n");
+}
+
 function sourceExcerpt(source, line, column, size = 1) {
   if (!source || !line) {
     return "";
@@ -5085,9 +5182,9 @@ const analyzers = {
   }),
   source: async (page, url) => ({
     ok: true,
-    engine: "playwright",
+    engine: "fetch+html-formatter",
     url,
-    source: await getSource(url),
+    source: formatHtmlSource(await getSource(url)),
   }),
   dom: async (page, url) => ({
     ok: true,
@@ -5268,11 +5365,14 @@ app.get("/analyze", async (req, res) => {
     const url = await validatePublicUrl(requestedUrl);
 
     if (command === "source") {
+      const source = await getSource(url);
+
       res.json({
         ok: true,
-        engine: "fetch",
+        engine: "fetch+html-formatter",
         url,
-        source: await getSource(url),
+        source: formatHtmlSource(source),
+        sourceCharacters: source.length,
       });
       return;
     }
