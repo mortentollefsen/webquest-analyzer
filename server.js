@@ -3252,16 +3252,58 @@ async function getCssColors(page) {
       return String(text || "").replace(/\s+/g, " ").trim();
     }
 
-    function colorName(value) {
-      const match = String(value).match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
-      if (!match) return value;
-      const red = Number(match[1]);
-      const green = Number(match[2]);
-      const blue = Number(match[3]);
+    function parseColor(value) {
+      const text = String(value || "").trim();
+
+      if (!text || text === "transparent") {
+        return null;
+      }
+
+      const match = text.match(/rgba?\(([^)]+)\)/i);
+
+      if (!match) {
+        return null;
+      }
+
+      const parts = match[1].split(",").map((part) => part.trim());
+      const red = Number(parts[0]);
+      const green = Number(parts[1]);
+      const blue = Number(parts[2]);
+      const alpha = parts[3] === undefined ? 1 : Number(parts[3]);
+
+      if (![red, green, blue, alpha].every(Number.isFinite)) {
+        return null;
+      }
+
+      return {
+        r: Math.max(0, Math.min(255, red)),
+        g: Math.max(0, Math.min(255, green)),
+        b: Math.max(0, Math.min(255, blue)),
+        a: Math.max(0, Math.min(1, alpha)),
+      };
+    }
+
+    function blend(top, bottom) {
+      const alpha = top.a + bottom.a * (1 - top.a);
+
+      if (alpha === 0) {
+        return { r: 255, g: 255, b: 255, a: 1 };
+      }
+
+      return {
+        r: Math.round((top.r * top.a + bottom.r * bottom.a * (1 - top.a)) / alpha),
+        g: Math.round((top.g * top.a + bottom.g * bottom.a * (1 - top.a)) / alpha),
+        b: Math.round((top.b * top.a + bottom.b * bottom.a * (1 - top.a)) / alpha),
+        a: alpha,
+      };
+    }
+
+    function nearestColorName(red, green, blue) {
       const colors = [
-        ["svart", 0, 0, 0], ["hvit", 255, 255, 255], ["grå", 128, 128, 128],
+        ["svart", 0, 0, 0], ["hvit", 255, 255, 255],
+        ["lys grå", 245, 245, 245], ["grå", 128, 128, 128], ["mørk grå", 51, 51, 51],
         ["rød", 220, 20, 60], ["oransje", 255, 140, 0], ["gul", 255, 215, 0],
-        ["grønn", 34, 139, 34], ["turkis", 64, 224, 208], ["blå", 30, 144, 255],
+        ["mørk grønn", 25, 69, 43], ["grønn", 34, 139, 34], ["turkis", 64, 224, 208], ["blå", 30, 144, 255],
         ["marineblå", 0, 31, 63], ["lilla", 128, 0, 128], ["rosa", 255, 105, 180],
         ["brun", 139, 69, 19], ["beige", 245, 245, 220],
       ];
@@ -3276,7 +3318,38 @@ async function getCssColors(page) {
         }
       });
 
-      return `${value} (${best[0]})`;
+      return best[0];
+    }
+
+    function colorText(color) {
+      const red = Math.round(color.r);
+      const green = Math.round(color.g);
+      const blue = Math.round(color.b);
+      const hex = [red, green, blue]
+        .map((value) => value.toString(16).padStart(2, "0"))
+        .join("");
+      const name = nearestColorName(red, green, blue);
+
+      return `#${hex} (${name})`;
+    }
+
+    function effectiveBackground(element) {
+      let background = { r: 255, g: 255, b: 255, a: 1 };
+      const colors = [];
+
+      for (let node = element; node; node = node.parentElement) {
+        const color = parseColor(window.getComputedStyle(node).backgroundColor);
+
+        if (color && color.a > 0) {
+          colors.push(color);
+        }
+      }
+
+      colors.reverse().forEach((color) => {
+        background = blend(color, background);
+      });
+
+      return background;
     }
 
     function visible(element) {
@@ -3291,12 +3364,22 @@ async function getCssColors(page) {
       .filter((element) => visible(element) && normalized(element.innerText || element.textContent))
       .forEach((element) => {
         const style = window.getComputedStyle(element);
-        const key = `${style.color}|${style.backgroundColor}`;
+        const background = effectiveBackground(element);
+        const foreground = parseColor(style.color);
+
+        if (!foreground || foreground.a === 0) {
+          return;
+        }
+
+        const effectiveForeground = blend(foreground, background);
+        const foregroundText = colorText(effectiveForeground);
+        const backgroundText = colorText(background);
+        const key = `${foregroundText}|${backgroundText}`;
 
         if (!map.has(key)) {
           map.set(key, {
-            color: colorName(style.color),
-            backgroundColor: colorName(style.backgroundColor),
+            color: foregroundText,
+            backgroundColor: backgroundText,
             count: 0,
             examples: [],
           });
