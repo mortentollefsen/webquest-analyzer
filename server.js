@@ -3173,12 +3173,16 @@ async function getCssFocusStyles(page) {
     function snapshot(element) {
       const style = window.getComputedStyle(element);
       return {
+        color: style.color,
         outlineStyle: style.outlineStyle,
         outlineWidth: style.outlineWidth,
         outlineColor: style.outlineColor,
         boxShadow: style.boxShadow,
+        borderStyle: style.borderStyle,
+        borderWidth: style.borderWidth,
         borderColor: style.borderColor,
         backgroundColor: style.backgroundColor,
+        textDecorationLine: style.textDecorationLine,
       };
     }
 
@@ -3199,16 +3203,33 @@ async function getCssFocusStyles(page) {
       const changedProperties = changed(before, after);
       const outlineVisible = after.outlineStyle !== "none" && after.outlineWidth !== "0px";
       const boxShadowVisible = after.boxShadow !== "none" && after.boxShadow !== before.boxShadow;
-      const borderChanged = after.borderColor !== before.borderColor;
+      const borderChanged =
+        after.borderColor !== before.borderColor ||
+        after.borderWidth !== before.borderWidth ||
+        after.borderStyle !== before.borderStyle;
+      const backgroundChanged = after.backgroundColor !== before.backgroundColor;
+      const colorChanged = after.color !== before.color;
+      const textDecorationChanged = after.textDecorationLine !== before.textDecorationLine && after.textDecorationLine !== "none";
+      const visibleFocusEvidence = [];
+
+      if (outlineVisible) visibleFocusEvidence.push("outline");
+      if (boxShadowVisible) visibleFocusEvidence.push("box-shadow");
+      if (borderChanged) visibleFocusEvidence.push("border");
+      if (backgroundChanged) visibleFocusEvidence.push("bakgrunnsfarge");
+      if (colorChanged) visibleFocusEvidence.push("tekstfarge");
+      if (textDecorationChanged) visibleFocusEvidence.push("tekstdekorasjon");
 
       items.push({
         element: element.tagName.toLowerCase(),
         selector: selectorFor(element),
         text: normalized(element.innerText || element.value || element.getAttribute("aria-label") || element.textContent).slice(0, 100),
-        hasVisibleFocus: outlineVisible || boxShadowVisible || borderChanged,
+        hasVisibleFocus: visibleFocusEvidence.length > 0,
+        visibleFocusEvidence,
         changedProperties,
         outline: `${after.outlineWidth} ${after.outlineStyle} ${after.outlineColor}`,
         boxShadow: after.boxShadow,
+        color: after.color,
+        backgroundColor: after.backgroundColor,
       });
     }
 
