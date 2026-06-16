@@ -2867,65 +2867,88 @@ async function getFonts(page) {
       return true;
     }
 
-    function nearestColorName(red, green, blue) {
-      const colors = [
-        ["svart", 0, 0, 0],
-        ["hvit", 255, 255, 255],
-        ["mørk grå", 64, 64, 64],
-        ["grå", 128, 128, 128],
-        ["lys grå", 211, 211, 211],
-        ["sølvgrå", 192, 192, 192],
-        ["rød", 220, 20, 60],
-        ["mørk rød", 139, 0, 0],
-        ["lys rød", 255, 102, 102],
-        ["rosa", 255, 105, 180],
-        ["lys rosa", 255, 182, 193],
-        ["burgunder", 128, 0, 32],
-        ["oransje", 255, 140, 0],
-        ["mørk oransje", 204, 85, 0],
-        ["fersken", 255, 218, 185],
-        ["brun", 139, 69, 19],
-        ["mørk brun", 92, 64, 51],
-        ["beige", 245, 245, 220],
-        ["sand", 194, 178, 128],
-        ["gul", 255, 215, 0],
-        ["lys gul", 255, 255, 153],
-        ["oliven", 128, 128, 0],
-        ["limegrønn", 50, 205, 50],
-        ["grønn", 34, 139, 34],
-        ["mørk grønn", 0, 100, 0],
-        ["lys grønn", 144, 238, 144],
-        ["mintgrønn", 152, 255, 152],
-        ["turkis", 64, 224, 208],
-        ["mørk turkis", 0, 128, 128],
-        ["cyan", 0, 255, 255],
-        ["lys blå", 135, 206, 250],
-        ["blå", 30, 144, 255],
-        ["mørk blå", 0, 0, 139],
-        ["marineblå", 0, 31, 63],
-        ["blågrå", 96, 125, 139],
-        ["indigo", 75, 0, 130],
-        ["lilla", 128, 0, 128],
-        ["mørk lilla", 75, 0, 100],
-        ["lys lilla", 216, 191, 216],
-        ["magenta", 255, 0, 255],
-      ];
-      let best = colors[0];
-      let bestDistance = Number.POSITIVE_INFINITY;
+    function describeColor(red, green, blue) {
+      const r = Math.max(0, Math.min(255, Math.round(red))) / 255;
+      const g = Math.max(0, Math.min(255, Math.round(green))) / 255;
+      const b = Math.max(0, Math.min(255, Math.round(blue))) / 255;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+      const lightness = (max + min) / 2;
+      const saturation = delta === 0 ? 0 : delta / (1 - Math.abs(2 * lightness - 1));
+      let hue = 0;
 
-      colors.forEach((color) => {
-        const distance =
-          (red - color[1]) ** 2 +
-          (green - color[2]) ** 2 +
-          (blue - color[3]) ** 2;
-
-        if (distance < bestDistance) {
-          best = color;
-          bestDistance = distance;
+      if (delta !== 0) {
+        if (max === r) {
+          hue = ((g - b) / delta) % 6;
+        } else if (max === g) {
+          hue = (b - r) / delta + 2;
+        } else {
+          hue = (r - g) / delta + 4;
         }
-      });
 
-      return best[0];
+        hue = Math.round(hue * 60);
+        if (hue < 0) {
+          hue += 360;
+        }
+      }
+
+      if (lightness <= 0.04) {
+        return "svart";
+      }
+
+      if (lightness >= 0.97 && saturation <= 0.12) {
+        return "hvit";
+      }
+
+      if (saturation <= 0.08) {
+        const tone = red > blue + 8 ? "varm " : blue > red + 8 ? "kald " : "nøytral ";
+        if (lightness >= 0.92) return "nesten hvit";
+        if (lightness >= 0.78) return `svært lys ${tone}grå`;
+        if (lightness >= 0.62) return `lys ${tone}grå`;
+        if (lightness >= 0.42) return `${tone}grå`;
+        if (lightness >= 0.20) return `mørk ${tone}grå`;
+        return "nesten svart";
+      }
+
+      const hueNames = [
+        [12, "rød"],
+        [28, "rødoransje"],
+        [45, "oransje"],
+        [65, "guloransje"],
+        [85, "gul"],
+        [145, "gulgrønn"],
+        [170, "grønn"],
+        [195, "blågrønn"],
+        [215, "turkis"],
+        [245, "blå"],
+        [275, "blåfiolett"],
+        [305, "lilla"],
+        [330, "fiolett"],
+        [345, "magentarød"],
+        [360, "rød"],
+      ];
+      let hueName = hueNames.find(([limit]) => hue <= limit)?.[1] || "rød";
+
+      if (hue >= 18 && hue <= 55 && saturation >= 0.20 && lightness < 0.43) {
+        hueName = "brun";
+      } else if (hue >= 35 && hue <= 75 && saturation < 0.45 && lightness >= 0.62) {
+        hueName = "beige";
+      } else if ((hue >= 330 || hue <= 12) && lightness >= 0.68 && saturation < 0.75) {
+        hueName = "rosa";
+      }
+
+      const modifiers = [];
+      if (lightness >= 0.90) modifiers.push("svært lys");
+      else if (lightness >= 0.72) modifiers.push("lys");
+      else if (lightness <= 0.16) modifiers.push("svært mørk");
+      else if (lightness <= 0.34) modifiers.push("mørk");
+
+      if (saturation <= 0.22) modifiers.push("svakt mettet");
+      else if (saturation <= 0.42) modifiers.push("dempet");
+      else if (saturation >= 0.78) modifiers.push("klar");
+
+      return [...modifiers, hueName].join(" ");
     }
 
     function colorInfo(color) {
@@ -2941,10 +2964,10 @@ async function getFonts(page) {
       const blue = Number(parts[2]);
       const alpha = parts[3] === undefined ? 1 : Number(parts[3]);
       const hex = [red, green, blue]
-        .map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0"))
+        .map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0"))
         .join("");
       const value = `#${hex}`;
-      const name = nearestColorName(red, green, blue);
+      const name = describeColor(red, green, blue);
       const text = alpha < 1 ? `${value} (${name}), alfa ${alpha}` : `${value} (${name})`;
 
       return { text, value };
@@ -3298,27 +3321,88 @@ async function getCssColors(page) {
       };
     }
 
-    function nearestColorName(red, green, blue) {
-      const colors = [
-        ["svart", 0, 0, 0], ["hvit", 255, 255, 255],
-        ["lys grå", 245, 245, 245], ["grå", 128, 128, 128], ["mørk grå", 51, 51, 51],
-        ["rød", 220, 20, 60], ["oransje", 255, 140, 0], ["gul", 255, 215, 0],
-        ["mørk grønn", 25, 69, 43], ["grønn", 34, 139, 34], ["turkis", 64, 224, 208], ["blå", 30, 144, 255],
-        ["marineblå", 0, 31, 63], ["lilla", 128, 0, 128], ["rosa", 255, 105, 180],
-        ["brun", 139, 69, 19], ["beige", 245, 245, 220],
-      ];
-      let best = colors[0];
-      let bestDistance = Infinity;
+    function describeColor(red, green, blue) {
+      const r = Math.max(0, Math.min(255, Math.round(red))) / 255;
+      const g = Math.max(0, Math.min(255, Math.round(green))) / 255;
+      const b = Math.max(0, Math.min(255, Math.round(blue))) / 255;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const delta = max - min;
+      const lightness = (max + min) / 2;
+      const saturation = delta === 0 ? 0 : delta / (1 - Math.abs(2 * lightness - 1));
+      let hue = 0;
 
-      colors.forEach((color) => {
-        const distance = (red - color[1]) ** 2 + (green - color[2]) ** 2 + (blue - color[3]) ** 2;
-        if (distance < bestDistance) {
-          best = color;
-          bestDistance = distance;
+      if (delta !== 0) {
+        if (max === r) {
+          hue = ((g - b) / delta) % 6;
+        } else if (max === g) {
+          hue = (b - r) / delta + 2;
+        } else {
+          hue = (r - g) / delta + 4;
         }
-      });
 
-      return best[0];
+        hue = Math.round(hue * 60);
+        if (hue < 0) {
+          hue += 360;
+        }
+      }
+
+      if (lightness <= 0.04) {
+        return "svart";
+      }
+
+      if (lightness >= 0.97 && saturation <= 0.12) {
+        return "hvit";
+      }
+
+      if (saturation <= 0.08) {
+        const tone = red > blue + 8 ? "varm " : blue > red + 8 ? "kald " : "nøytral ";
+        if (lightness >= 0.92) return "nesten hvit";
+        if (lightness >= 0.78) return `svært lys ${tone}grå`;
+        if (lightness >= 0.62) return `lys ${tone}grå`;
+        if (lightness >= 0.42) return `${tone}grå`;
+        if (lightness >= 0.20) return `mørk ${tone}grå`;
+        return "nesten svart";
+      }
+
+      const hueNames = [
+        [12, "rød"],
+        [28, "rødoransje"],
+        [45, "oransje"],
+        [65, "guloransje"],
+        [85, "gul"],
+        [145, "gulgrønn"],
+        [170, "grønn"],
+        [195, "blågrønn"],
+        [215, "turkis"],
+        [245, "blå"],
+        [275, "blåfiolett"],
+        [305, "lilla"],
+        [330, "fiolett"],
+        [345, "magentarød"],
+        [360, "rød"],
+      ];
+      let hueName = hueNames.find(([limit]) => hue <= limit)?.[1] || "rød";
+
+      if (hue >= 18 && hue <= 55 && saturation >= 0.20 && lightness < 0.43) {
+        hueName = "brun";
+      } else if (hue >= 35 && hue <= 75 && saturation < 0.45 && lightness >= 0.62) {
+        hueName = "beige";
+      } else if ((hue >= 330 || hue <= 12) && lightness >= 0.68 && saturation < 0.75) {
+        hueName = "rosa";
+      }
+
+      const modifiers = [];
+      if (lightness >= 0.90) modifiers.push("svært lys");
+      else if (lightness >= 0.72) modifiers.push("lys");
+      else if (lightness <= 0.16) modifiers.push("svært mørk");
+      else if (lightness <= 0.34) modifiers.push("mørk");
+
+      if (saturation <= 0.22) modifiers.push("svakt mettet");
+      else if (saturation <= 0.42) modifiers.push("dempet");
+      else if (saturation >= 0.78) modifiers.push("klar");
+
+      return [...modifiers, hueName].join(" ");
     }
 
     function colorText(color) {
@@ -3326,9 +3410,9 @@ async function getCssColors(page) {
       const green = Math.round(color.g);
       const blue = Math.round(color.b);
       const hex = [red, green, blue]
-        .map((value) => value.toString(16).padStart(2, "0"))
+        .map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0"))
         .join("");
-      const name = nearestColorName(red, green, blue);
+      const name = describeColor(red, green, blue);
 
       return `#${hex} (${name})`;
     }
