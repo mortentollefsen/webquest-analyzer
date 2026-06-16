@@ -288,6 +288,10 @@ async function analyzePage(url, analyzer, options = {}) {
 async function handleCookieChoice(page, options = {}) {
   const choice = String(options.cookieChoice || "").trim();
 
+  if (!options.cookieFlow && !choice) {
+    return null;
+  }
+
   if (choice) {
     if (choice !== "__skip__") {
       await clickCookieControl(page, choice);
@@ -5158,6 +5162,7 @@ app.get("/analyze", async (req, res) => {
   const requestedUrl = normalizeUrl(req.query.url);
   const selector = String(req.query.selector || "").trim();
   const cookieChoice = String(req.query.cookieChoice || "").trim();
+  const cookieFlow = String(req.query.cookieFlow || "") === "1";
 
   if (command === "describe") {
     if (!requestedUrl) {
@@ -5226,7 +5231,7 @@ app.get("/analyze", async (req, res) => {
 
     try {
       const url = await validatePublicUrl(requestedUrl);
-      const archive = await createSaveArchive(url, { cookieChoice });
+      const archive = await createSaveArchive(url, { cookieChoice, cookieFlow });
 
       if (archive.cookieChoiceNeeded) {
         res.json(archive);
@@ -5275,7 +5280,7 @@ app.get("/analyze", async (req, res) => {
     const result = await analyzePage(
       url,
       (page) => analyzers[command](page, url, { selector }),
-      { cookieChoice }
+      { cookieChoice, cookieFlow }
     );
 
     res.json(result);
