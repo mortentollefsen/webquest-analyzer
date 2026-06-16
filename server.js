@@ -224,7 +224,7 @@ function setCorsHeaders(req, res) {
   }
 }
 
-async function analyzePage(url, analyzer) {
+async function analyzePage(url, analyzer, options = {}) {
   if (process.env.WEBQUEST_USE_PERSISTENT_BROWSER === "true") {
     const context = await getPersistentContext();
     let page;
@@ -232,6 +232,11 @@ async function analyzePage(url, analyzer) {
     try {
       page = await context.newPage();
       await gotoForAnalysis(page, url, 90000);
+      const cookieResult = await handleCookieChoice(page, options);
+
+      if (cookieResult) {
+        return cookieResult;
+      }
 
       return await withPageInfo(page, analyzer);
     } catch (error) {
@@ -240,6 +245,11 @@ async function analyzePage(url, analyzer) {
         const retryContext = await getPersistentContext();
         page = await retryContext.newPage();
         await gotoForAnalysis(page, url, 90000);
+        const cookieResult = await handleCookieChoice(page, options);
+
+        if (cookieResult) {
+          return cookieResult;
+        }
 
         return await withPageInfo(page, analyzer);
       }
@@ -263,11 +273,232 @@ async function analyzePage(url, analyzer) {
 
   try {
     await gotoForAnalysis(page, url, 30000);
+    const cookieResult = await handleCookieChoice(page, options);
+
+    if (cookieResult) {
+      return cookieResult;
+    }
 
     return await withPageInfo(page, analyzer);
   } finally {
     await context.close();
   }
+}
+
+async function handleCookieChoice(page, options = {}) {
+  const choice = String(options.cookieChoice || "").trim();
+
+  if (choice) {
+    if (choice !== "__skip__") {
+      await clickCookieControl(page, choice);
+    }
+
+    return null;
+  }
+
+  const banner = await detectCookieBanner(page);
+
+  if (!banner) {
+    return null;
+  }
+
+  return {
+    ok: true,
+    cookieChoiceNeeded: true,
+    cookieBanner: banner,
+    pageInfo: await getPageInfo(page),
+  };
+}
+
+async function detectCookieBanner(page) {
+  return page.evaluate(() => {
+    const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|personvern|privacy|consent|gdpr|usercentrics/i;
+    const controlSelector = "button, a[href], input[type='button'], input[type='submit'], [role='button'], [tabindex]";
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+
+      return rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number.parseFloat(style.opacity || "1") > 0.05;
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 4; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    function controlName(element) {
+      const ariaLabelledby = element.getAttribute("aria-labelledby");
+      const labelledText = ariaLabelledby
+        ? ariaLabelledby.split(/\s+/)
+            .map((id) => normalized(document.getElementById(id)?.innerText || document.getElementById(id)?.textContent))
+            .filter(Boolean)
+            .join(" ")
+        : "";
+
+      return normalized(
+        element.getAttribute("aria-label") ||
+        labelledText ||
+        element.value ||
+        element.innerText ||
+        element.textContent ||
+        element.title ||
+        element.getAttribute("name")
+      );
+    }
+
+    const candidates = Array.from(document.querySelectorAll(
+      "[role='dialog'], [aria-modal='true'], dialog, aside, section, div, form"
+    ))
+      .filter(visible)
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const text = normalized(element.innerText || element.textContent);
+        const controls = Array.from(element.querySelectorAll(controlSelector))
+          .filter((control) => visible(control))
+          .map((control) => ({
+            label: controlName(control),
+            selector: selectorFor(control),
+            element: control.tagName.toLowerCase(),
+          }))
+          .filter((control) => control.label && !/cookiebot av|usercentrics|åpner i et nytt vindu|opens in a new window/i.test(control.label))
+          .slice(0, 10);
+        const fixed = ["fixed", "sticky"].includes(style.position);
+        const modal = element.getAttribute("role") === "dialog" ||
+          element.getAttribute("aria-modal") === "true" ||
+          element.tagName.toLowerCase() === "dialog";
+        const largeOverlay = rect.width >= window.innerWidth * 0.45 && rect.height >= 80;
+        const score =
+          (keywordPattern.test(text) ? 4 : 0) +
+          (controls.length ? 2 : 0) +
+          (fixed ? 2 : 0) +
+          (modal ? 2 : 0) +
+          (largeOverlay ? 1 : 0);
+
+        return { element, text, controls, score, fixed, modal, rect };
+      })
+      .filter((candidate) => candidate.score >= 6 && candidate.controls.length > 0)
+      .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+
+    const best = candidates[0];
+
+    if (!best) {
+      return null;
+    }
+
+    return {
+      textStart: best.text.slice(0, 220),
+      selector: selectorFor(best.element),
+      controls: best.controls.map((control, index) => ({
+        index: index + 1,
+        ...control,
+      })),
+    };
+  }).catch(() => null);
+}
+
+async function clickCookieControl(page, choice) {
+  await page.evaluate(async (rawChoice) => {
+    const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|personvern|privacy|consent|gdpr|usercentrics/i;
+    const controlSelector = "button, a[href], input[type='button'], input[type='submit'], [role='button'], [tabindex]";
+    const normalizedChoice = String(rawChoice || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+
+      return rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number.parseFloat(style.opacity || "1") > 0.05;
+    }
+
+    function controlName(element) {
+      const ariaLabelledby = element.getAttribute("aria-labelledby");
+      const labelledText = ariaLabelledby
+        ? ariaLabelledby.split(/\s+/)
+            .map((id) => normalized(document.getElementById(id)?.innerText || document.getElementById(id)?.textContent))
+            .filter(Boolean)
+            .join(" ")
+        : "";
+
+      return normalized(
+        element.getAttribute("aria-label") ||
+        labelledText ||
+        element.value ||
+        element.innerText ||
+        element.textContent ||
+        element.title ||
+        element.getAttribute("name")
+      );
+    }
+
+    const containers = Array.from(document.querySelectorAll(
+      "[role='dialog'], [aria-modal='true'], dialog, aside, section, div, form"
+    ))
+      .filter(visible)
+      .filter((element) => keywordPattern.test(normalized(element.innerText || element.textContent)));
+    const controls = containers
+      .flatMap((container) => Array.from(container.querySelectorAll(controlSelector)))
+      .filter(visible)
+      .map((element) => ({
+        element,
+        label: controlName(element),
+      }))
+      .filter((control) => control.label && !/cookiebot av|usercentrics|åpner i et nytt vindu|opens in a new window/i.test(control.label))
+      .map((control, index) => ({
+        ...control,
+        index: index + 1,
+      }));
+    const numericChoice = Number.parseInt(normalizedChoice, 10);
+    const exact = controls.find((control) => control.index === numericChoice) ||
+      controls.find((control) => control.label.toLowerCase() === normalizedChoice) ||
+      controls.find((control) => control.label.toLowerCase().includes(normalizedChoice));
+
+    if (!exact) {
+      return false;
+    }
+
+    exact.element.click();
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    return true;
+  }, choice).catch(() => false);
+
+  await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(500);
 }
 
 async function withPageInfo(page, analyzer) {
@@ -3154,7 +3385,33 @@ async function getCssHidden(page) {
 }
 
 async function getCssFocusStyles(page) {
-  return page.evaluate(async () => {
+  function changed(before, after) {
+    return Object.keys(before).filter((key) => before[key] !== after[key]);
+  }
+
+  function focusEvidence(before, after) {
+    const outlineVisible = after.outlineStyle !== "none" && after.outlineWidth !== "0px";
+    const boxShadowVisible = after.boxShadow !== "none" && after.boxShadow !== before.boxShadow;
+    const borderChanged =
+      after.borderColor !== before.borderColor ||
+      after.borderWidth !== before.borderWidth ||
+      after.borderStyle !== before.borderStyle;
+    const backgroundChanged = after.backgroundColor !== before.backgroundColor;
+    const colorChanged = after.color !== before.color;
+    const textDecorationChanged = after.textDecorationLine !== before.textDecorationLine && after.textDecorationLine !== "none";
+    const evidence = [];
+
+    if (outlineVisible) evidence.push("outline");
+    if (boxShadowVisible) evidence.push("box-shadow");
+    if (borderChanged) evidence.push("border");
+    if (backgroundChanged) evidence.push("bakgrunnsfarge");
+    if (colorChanged) evidence.push("tekstfarge");
+    if (textDecorationChanged) evidence.push("tekstdekorasjon");
+
+    return evidence;
+  }
+
+  const initial = await page.evaluate(() => {
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
     }
@@ -3186,62 +3443,134 @@ async function getCssFocusStyles(page) {
       };
     }
 
-    function changed(before, after) {
-      return Object.keys(before).filter((key) => before[key] !== after[key]);
-    }
-
     const elements = Array.from(document.querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex]"))
       .filter((element) => visible(element) && !element.disabled)
       .slice(0, 80);
-    const items = [];
+    const items = elements.map((element, index) => {
+      const id = `wq-focus-${index}`;
+      element.setAttribute("data-webquest-focus-id", id);
 
-    for (const element of elements) {
-      const before = snapshot(element);
-      element.focus({ preventScroll: true });
-      await new Promise((resolve) => requestAnimationFrame(resolve));
-      const after = snapshot(element);
-      const changedProperties = changed(before, after);
-      const outlineVisible = after.outlineStyle !== "none" && after.outlineWidth !== "0px";
-      const boxShadowVisible = after.boxShadow !== "none" && after.boxShadow !== before.boxShadow;
-      const borderChanged =
-        after.borderColor !== before.borderColor ||
-        after.borderWidth !== before.borderWidth ||
-        after.borderStyle !== before.borderStyle;
-      const backgroundChanged = after.backgroundColor !== before.backgroundColor;
-      const colorChanged = after.color !== before.color;
-      const textDecorationChanged = after.textDecorationLine !== before.textDecorationLine && after.textDecorationLine !== "none";
-      const visibleFocusEvidence = [];
-
-      if (outlineVisible) visibleFocusEvidence.push("outline");
-      if (boxShadowVisible) visibleFocusEvidence.push("box-shadow");
-      if (borderChanged) visibleFocusEvidence.push("border");
-      if (backgroundChanged) visibleFocusEvidence.push("bakgrunnsfarge");
-      if (colorChanged) visibleFocusEvidence.push("tekstfarge");
-      if (textDecorationChanged) visibleFocusEvidence.push("tekstdekorasjon");
-
-      items.push({
+      return {
+        id,
         element: element.tagName.toLowerCase(),
         selector: selectorFor(element),
         text: normalized(element.innerText || element.value || element.getAttribute("aria-label") || element.textContent).slice(0, 100),
-        hasVisibleFocus: visibleFocusEvidence.length > 0,
-        visibleFocusEvidence,
-        changedProperties,
-        outline: `${after.outlineWidth} ${after.outlineStyle} ${after.outlineColor}`,
-        boxShadow: after.boxShadow,
-        color: after.color,
-        backgroundColor: after.backgroundColor,
-      });
-    }
+        before: snapshot(element),
+      };
+    });
 
-    const missing = items.filter((item) => !item.hasVisibleFocus).length;
+    document.body.setAttribute("tabindex", "-1");
+    document.body.focus({ preventScroll: true });
 
     return {
-      checked: items.length,
-      missing,
       items,
       truncated: document.querySelectorAll("a[href], button, input, select, textarea, summary, [tabindex]").length > 80,
     };
   });
+
+  const focusedByKeyboard = new Map();
+  const maxTabs = Math.min(Math.max(initial.items.length + 10, 20), 120);
+
+  for (let index = 0; index < maxTabs; index += 1) {
+    await page.keyboard.press("Tab");
+    await new Promise((resolve) => setTimeout(resolve, 40));
+
+    const active = await page.evaluate(() => {
+      function snapshot(element) {
+        const style = window.getComputedStyle(element);
+        return {
+          color: style.color,
+          outlineStyle: style.outlineStyle,
+          outlineWidth: style.outlineWidth,
+          outlineColor: style.outlineColor,
+          boxShadow: style.boxShadow,
+          borderStyle: style.borderStyle,
+          borderWidth: style.borderWidth,
+          borderColor: style.borderColor,
+          backgroundColor: style.backgroundColor,
+          textDecorationLine: style.textDecorationLine,
+        };
+      }
+
+      const element = document.activeElement?.closest?.("[data-webquest-focus-id]");
+
+      if (!element) {
+        return null;
+      }
+
+      return {
+        id: element.getAttribute("data-webquest-focus-id"),
+        after: snapshot(element),
+      };
+    });
+
+    if (active?.id && !focusedByKeyboard.has(active.id)) {
+      focusedByKeyboard.set(active.id, active.after);
+    }
+  }
+
+  const fallback = await page.evaluate(async (ids) => {
+    function snapshot(element) {
+      const style = window.getComputedStyle(element);
+      return {
+        color: style.color,
+        outlineStyle: style.outlineStyle,
+        outlineWidth: style.outlineWidth,
+        outlineColor: style.outlineColor,
+        boxShadow: style.boxShadow,
+        borderStyle: style.borderStyle,
+        borderWidth: style.borderWidth,
+        borderColor: style.borderColor,
+        backgroundColor: style.backgroundColor,
+        textDecorationLine: style.textDecorationLine,
+      };
+    }
+
+    const results = {};
+
+    for (const id of ids) {
+      const element = document.querySelector(`[data-webquest-focus-id="${CSS.escape(id)}"]`);
+
+      if (!element) {
+        continue;
+      }
+
+      element.focus({ preventScroll: true });
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      results[id] = snapshot(element);
+    }
+
+    return results;
+  }, initial.items.filter((item) => !focusedByKeyboard.has(item.id)).map((item) => item.id));
+
+  const items = initial.items.map((item) => {
+    const keyboardAfter = focusedByKeyboard.get(item.id);
+    const after = keyboardAfter || fallback[item.id] || item.before;
+    const visibleFocusEvidence = focusEvidence(item.before, after);
+
+    return {
+      element: item.element,
+      selector: item.selector,
+      text: item.text,
+      hasVisibleFocus: visibleFocusEvidence.length > 0,
+      visibleFocusEvidence,
+      focusMethod: keyboardAfter ? "tastatur" : "programmatisk reserve",
+      changedProperties: changed(item.before, after),
+      outline: `${after.outlineWidth} ${after.outlineStyle} ${after.outlineColor}`,
+      boxShadow: after.boxShadow,
+      color: after.color,
+      backgroundColor: after.backgroundColor,
+    };
+  });
+
+  const missing = items.filter((item) => !item.hasVisibleFocus).length;
+
+  return {
+    checked: items.length,
+    missing,
+    items,
+    truncated: initial.truncated,
+  };
 }
 
 async function getCssResponsive(page, url) {
@@ -3974,7 +4303,7 @@ function timestampPart(date = new Date()) {
   return `${value("year")}${value("month")}${value("day")}-${value("hour")}${value("minute")}${value("second")}`;
 }
 
-async function createSaveArchive(url) {
+async function createSaveArchive(url, options = {}) {
   const browser = await getBrowser();
   const context = await browser.newContext({
     bypassCSP: true,
@@ -3986,6 +4315,12 @@ async function createSaveArchive(url) {
 
   try {
     await gotoForAnalysis(page, url, 45000);
+    const cookieResult = await handleCookieChoice(page, options);
+
+    if (cookieResult) {
+      return cookieResult;
+    }
+
     await page.emulateMedia({ media: "screen" }).catch(() => {});
 
     const title = await page.title().catch(() => "");
@@ -4822,6 +5157,7 @@ app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
   const selector = String(req.query.selector || "").trim();
+  const cookieChoice = String(req.query.cookieChoice || "").trim();
 
   if (command === "describe") {
     if (!requestedUrl) {
@@ -4890,7 +5226,12 @@ app.get("/analyze", async (req, res) => {
 
     try {
       const url = await validatePublicUrl(requestedUrl);
-      const archive = await createSaveArchive(url);
+      const archive = await createSaveArchive(url, { cookieChoice });
+
+      if (archive.cookieChoiceNeeded) {
+        res.json(archive);
+        return;
+      }
 
       res.set("Content-Type", "application/zip");
       res.set("Content-Disposition", `attachment; filename="${archive.filename}"`);
@@ -4931,7 +5272,11 @@ app.get("/analyze", async (req, res) => {
       return;
     }
 
-    const result = await analyzePage(url, (page) => analyzers[command](page, url, { selector }));
+    const result = await analyzePage(
+      url,
+      (page) => analyzers[command](page, url, { selector }),
+      { cookieChoice }
+    );
 
     res.json(result);
   } catch (error) {
