@@ -16,19 +16,120 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 
 let browserPromise;
 let persistentContextPromise;
+let browserUseCount = 0;
+let activeAnalyses = 0;
+const analysisQueue = [];
+const maxConcurrentAnalyses = Math.max(1, Number(process.env.WEBQUEST_MAX_CONCURRENT_ANALYSES || 1));
+const maxQueuedAnalyses = Math.max(1, Number(process.env.WEBQUEST_MAX_QUEUED_ANALYSES || 20));
+const recycleBrowserAfterUses = Math.max(1, Number(process.env.WEBQUEST_RECYCLE_BROWSER_AFTER_USES || 35));
+const recycleBrowserAfterRssMb = Math.max(128, Number(process.env.WEBQUEST_RECYCLE_BROWSER_AFTER_RSS_MB || 420));
+const maxColorblindScreenshots = Math.max(1, Number(process.env.WEBQUEST_MAX_COLORBLIND_SCREENSHOTS || 6));
+const maxBrokenLinkWorkers = Math.max(1, Number(process.env.WEBQUEST_BROKEN_LINK_WORKERS || 4));
 const crcTable = createCrcTable();
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
 });
 
-function getBrowser() {
+function browserContextOptions(extra = {}) {
+  return {
+    bypassCSP: true,
+    locale: "nb-NO",
+    serviceWorkers: "block",
+    userAgent:
+      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+    ...extra,
+  };
+}
+
+async function getBrowser() {
   if (!browserPromise) {
     browserPromise = chromium.launch({
-      args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-extensions",
+      ],
+    }).catch((error) => {
+      browserPromise = null;
+      throw error;
     });
   }
 
+  browserUseCount += 1;
   return browserPromise;
+}
+
+function currentRssMb() {
+  return Math.round(process.memoryUsage().rss / 1024 / 1024);
+}
+
+async function closeSharedBrowser(reason = "") {
+  if (!browserPromise) {
+    return;
+  }
+
+  const browser = await browserPromise.catch(() => null);
+  browserPromise = null;
+  browserUseCount = 0;
+
+  if (browser) {
+    await browser.close().catch(() => {});
+  }
+
+  if (reason) {
+    console.log(`Chromium recycled: ${reason}. RSS ${currentRssMb()} MB.`);
+  }
+}
+
+async function recycleBrowserIfNeeded() {
+  if (!browserPromise || activeAnalyses > 0) {
+    return;
+  }
+
+  const rss = currentRssMb();
+
+  if (browserUseCount >= recycleBrowserAfterUses) {
+    await closeSharedBrowser(`${browserUseCount} uses`);
+    return;
+  }
+
+  if (rss >= recycleBrowserAfterRssMb) {
+    await closeSharedBrowser(`RSS ${rss} MB`);
+  }
+}
+
+function acquireAnalysisSlot() {
+  if (activeAnalyses < maxConcurrentAnalyses) {
+    activeAnalyses += 1;
+    return Promise.resolve();
+  }
+
+  if (analysisQueue.length >= maxQueuedAnalyses) {
+    return Promise.reject(new Error("Analyzeren er opptatt. Prøv igjen om litt."));
+  }
+
+  return new Promise((resolve) => {
+    analysisQueue.push(resolve);
+  });
+}
+
+function releaseAnalysisSlot() {
+  activeAnalyses = Math.max(0, activeAnalyses - 1);
+
+  const next = analysisQueue.shift();
+
+  if (next) {
+    activeAnalyses += 1;
+    next();
+    return;
+  }
+
+  recycleBrowserIfNeeded().catch((error) => {
+    console.error("Kunne ikke resirkulere Chromium:", error);
+  });
 }
 
 function normalizeUrl(url) {
@@ -263,13 +364,9 @@ async function analyzePage(url, analyzer, options = {}) {
   }
 
   const browser = await getBrowser();
-  const context = await browser.newContext({
-    bypassCSP: true,
-    locale: "nb-NO",
-    userAgent:
-      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-  });
+  const context = await browser.newContext(browserContextOptions());
   const page = await context.newPage();
+  let session;
 
   try {
     await gotoForAnalysis(page, url, 30000);
@@ -281,7 +378,7 @@ async function analyzePage(url, analyzer, options = {}) {
 
     return await withPageInfo(page, analyzer);
   } finally {
-    await context.close();
+    await context.close().catch(() => {});
   }
 }
 
@@ -316,7 +413,9 @@ async function handleCookieChoice(page, options = {}) {
 
 async function detectCookieBanner(page) {
   return page.evaluate(() => {
-    const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|personvern|privacy|consent|gdpr|usercentrics/i;
+    const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot/i;
+    const weakKeywordPattern = /personvern|privacy/i;
+    const choicePattern = /^(godta|aksepter|accept|allow|tillat|avvis|decline|reject|deny|ikke tillat|lagre|save|bekreft|confirm|samtykk|innstillinger|settings|tilpass|administrer|manage|kun nødvendige|nødvendige|necessary|utvalg|valg)/i;
     const controlSelector = "button, a[href], input[type='button'], input[type='submit'], [role='button'], [tabindex]";
 
     function normalized(text) {
@@ -378,6 +477,31 @@ async function detectCookieBanner(page) {
       );
     }
 
+    function isLikelyPageChrome(element, rect, style) {
+      const tag = element.tagName.toLowerCase();
+
+      if (["header", "footer", "main", "nav"].includes(tag)) {
+        return true;
+      }
+
+      if (element.closest("header, footer, main, nav")) {
+        return true;
+      }
+
+      if (style.position === "static" && rect.top > window.innerHeight * 0.75) {
+        return true;
+      }
+
+      return false;
+    }
+
+    function isLikelyCookieControl(control) {
+      const label = control.label.toLowerCase();
+
+      return choicePattern.test(label) ||
+        /cookie|cookies|informasjonskaps|samtykke|consent|privacy settings|personverninnstillinger/i.test(label);
+    }
+
     const candidates = Array.from(document.querySelectorAll(
       "[role='dialog'], [aria-modal='true'], dialog, aside, section, div, form"
     ))
@@ -399,17 +523,37 @@ async function detectCookieBanner(page) {
         const modal = element.getAttribute("role") === "dialog" ||
           element.getAttribute("aria-modal") === "true" ||
           element.tagName.toLowerCase() === "dialog";
-        const largeOverlay = rect.width >= window.innerWidth * 0.45 && rect.height >= 80;
+        const nearViewportEdge = rect.top < 80 ||
+          rect.bottom > window.innerHeight - 80 ||
+          rect.left < 40 ||
+          rect.right > window.innerWidth - 40;
+        const largeOverlay = rect.width >= window.innerWidth * 0.45 &&
+          rect.height >= 80 &&
+          rect.top < window.innerHeight &&
+          nearViewportEdge;
+        const hasStrongKeyword = keywordPattern.test(text);
+        const hasWeakKeyword = weakKeywordPattern.test(text);
+        const likelyControls = controls.filter(isLikelyCookieControl);
+        const pageChrome = isLikelyPageChrome(element, rect, style);
         const score =
-          (keywordPattern.test(text) ? 4 : 0) +
+          (hasStrongKeyword ? 4 : 0) +
+          (!hasStrongKeyword && hasWeakKeyword ? 1 : 0) +
+          (likelyControls.length ? 4 : 0) +
           (controls.length ? 2 : 0) +
           (fixed ? 2 : 0) +
           (modal ? 2 : 0) +
-          (largeOverlay ? 1 : 0);
+          (largeOverlay ? 1 : 0) -
+          (pageChrome ? 6 : 0);
 
-        return { element, text, controls, score, fixed, modal, rect };
+        return { element, text, controls, likelyControls, score, fixed, modal, largeOverlay, pageChrome, rect };
       })
-      .filter((candidate) => candidate.score >= 6 && candidate.controls.length > 0)
+      .filter((candidate) =>
+        candidate.score >= 8 &&
+        candidate.controls.length > 0 &&
+        candidate.likelyControls.length > 0 &&
+        !candidate.pageChrome &&
+        (candidate.modal || candidate.fixed || candidate.largeOverlay)
+      )
       .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
 
     const best = candidates[0];
@@ -431,7 +575,9 @@ async function detectCookieBanner(page) {
 
 async function clickCookieControl(page, choice) {
   await page.evaluate(async (rawChoice) => {
-    const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|personvern|privacy|consent|gdpr|usercentrics/i;
+    const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot/i;
+    const weakKeywordPattern = /personvern|privacy/i;
+    const choicePattern = /^(godta|aksepter|accept|allow|tillat|avvis|decline|reject|deny|ikke tillat|lagre|save|bekreft|confirm|samtykk|innstillinger|settings|tilpass|administrer|manage|kun nødvendige|nødvendige|necessary|utvalg|valg)/i;
     const controlSelector = "button, a[href], input[type='button'], input[type='submit'], [role='button'], [tabindex]";
     const normalizedChoice = String(rawChoice || "").replace(/\s+/g, " ").trim().toLowerCase();
 
@@ -470,11 +616,61 @@ async function clickCookieControl(page, choice) {
       );
     }
 
+    function isLikelyPageChrome(element, rect, style) {
+      const tag = element.tagName.toLowerCase();
+
+      if (["header", "footer", "main", "nav"].includes(tag)) {
+        return true;
+      }
+
+      if (element.closest("header, footer, main, nav")) {
+        return true;
+      }
+
+      if (style.position === "static" && rect.top > window.innerHeight * 0.75) {
+        return true;
+      }
+
+      return false;
+    }
+
+    function isLikelyCookieControl(label) {
+      return choicePattern.test(label) ||
+        /cookie|cookies|informasjonskaps|samtykke|consent|privacy settings|personverninnstillinger/i.test(label);
+    }
+
     const containers = Array.from(document.querySelectorAll(
       "[role='dialog'], [aria-modal='true'], dialog, aside, section, div, form"
     ))
       .filter(visible)
-      .filter((element) => keywordPattern.test(normalized(element.innerText || element.textContent)));
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const text = normalized(element.innerText || element.textContent);
+        const controls = Array.from(element.querySelectorAll(controlSelector))
+          .filter(visible)
+          .map(controlName)
+          .filter(Boolean);
+        const fixed = ["fixed", "sticky"].includes(style.position);
+        const modal = element.getAttribute("role") === "dialog" ||
+          element.getAttribute("aria-modal") === "true" ||
+          element.tagName.toLowerCase() === "dialog";
+        const nearViewportEdge = rect.top < 80 ||
+          rect.bottom > window.innerHeight - 80 ||
+          rect.left < 40 ||
+          rect.right > window.innerWidth - 40;
+        const largeOverlay = rect.width >= window.innerWidth * 0.45 &&
+          rect.height >= 80 &&
+          rect.top < window.innerHeight &&
+          nearViewportEdge;
+        const hasStrongKeyword = keywordPattern.test(text);
+        const hasWeakKeyword = weakKeywordPattern.test(text);
+
+        return !isLikelyPageChrome(element, rect, style) &&
+          (modal || fixed || largeOverlay) &&
+          (hasStrongKeyword || hasWeakKeyword) &&
+          controls.some((label) => isLikelyCookieControl(label.toLowerCase()));
+      });
     const controls = containers
       .flatMap((container) => Array.from(container.querySelectorAll(controlSelector)))
       .filter(visible)
@@ -581,13 +777,9 @@ function isClosedBrowserError(error) {
 
 async function getPersistentContext() {
   if (!persistentContextPromise) {
-    const options = {
-      bypassCSP: true,
+    const options = browserContextOptions({
       headless: false,
-      locale: "nb-NO",
-      userAgent:
-        "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-    };
+    });
     const browserChannel = process.env.WEBQUEST_BROWSER_CHANNEL;
 
     if (browserChannel) {
@@ -632,12 +824,9 @@ function extractResponseText(data) {
 
 async function renderImageAsDataUrl(imageUrl) {
   const browser = await getBrowser();
-  const context = await browser.newContext({
+  const context = await browser.newContext(browserContextOptions({
     viewport: { width: 1400, height: 1000 },
-    locale: "nb-NO",
-    userAgent:
-      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-  });
+  }));
   const page = await context.newPage();
 
   try {
@@ -682,7 +871,7 @@ async function renderImageAsDataUrl(imageUrl) {
     const buffer = await image.screenshot({ type: "png" });
     return `data:image/png;base64,${buffer.toString("base64")}`;
   } finally {
-    await context.close();
+    await context.close().catch(() => {});
   }
 }
 
@@ -2165,7 +2354,7 @@ async function getBrokenLinks(page, pageUrl) {
   }
 
   const queue = Array.from(uniqueLinks.values());
-  const workers = Array.from({ length: Math.min(8, queue.length) }, async () => {
+  const workers = Array.from({ length: Math.min(maxBrokenLinkWorkers, queue.length) }, async () => {
     while (queue.length > 0) {
       const link = queue.shift();
       await checkLink(link);
@@ -4406,12 +4595,7 @@ function timestampPart(date = new Date()) {
 
 async function createSaveArchive(url, options = {}) {
   const browser = await getBrowser();
-  const context = await browser.newContext({
-    bypassCSP: true,
-    locale: "nb-NO",
-    userAgent:
-      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-  });
+  const context = await browser.newContext(browserContextOptions());
   const page = await context.newPage();
 
   try {
@@ -4428,7 +4612,7 @@ async function createSaveArchive(url, options = {}) {
     const finalUrl = page.url();
     const host = new URL(finalUrl).hostname.replace(/^www\./, "");
     const baseName = `${timestampPart()}-${slugPart(host)}-${slugPart(title, "uten-tittel")}`.slice(0, 140);
-    const session = await context.newCDPSession(page);
+    session = await context.newCDPSession(page);
     const snapshot = await session.send("Page.captureSnapshot", { format: "mhtml" });
     const pdfOptions = {
       format: "A4",
@@ -4474,7 +4658,11 @@ async function createSaveArchive(url, options = {}) {
       zip,
     };
   } finally {
-    await context.close();
+    if (session) {
+      await session.detach().catch(() => {});
+    }
+
+    await context.close().catch(() => {});
   }
 }
 
@@ -4870,7 +5058,8 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
     viewportHeight: window.innerHeight,
   }));
   const chunkHeight = Math.max(600, Math.min(pageSize.viewportHeight || 900, 1100));
-  const chunkCount = Math.max(1, Math.min(Math.ceil(pageSize.height / chunkHeight), 12));
+  const fullChunkCount = Math.ceil(pageSize.height / chunkHeight);
+  const chunkCount = Math.max(1, Math.min(fullChunkCount, maxColorblindScreenshots));
   const images = [];
   const seenScreenshotHashes = new Set();
   const seenScrollPositions = new Set();
@@ -4933,7 +5122,7 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
     }
 
     context.putImageData(imageData, 0, 0);
-    return canvas.toDataURL("image/png");
+    return canvas.toDataURL("image/jpeg", 0.82);
     }, { dataUrl, simulationMode: mode });
   }
 
@@ -4962,7 +5151,8 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
     await page.waitForTimeout(150);
 
     const screenshot = await page.screenshot({
-      type: "png",
+      type: "jpeg",
+      quality: 82,
     });
     const hash = crypto.createHash("sha256").update(screenshot).digest("hex");
 
@@ -4993,7 +5183,7 @@ async function getColorblindSimulation(page, mode = "deuteranopia") {
     images,
     hiddenCookieBanners: await countHiddenCookieOverlays(page),
     duplicateScreenshots,
-    truncated: Math.ceil(pageSize.height / chunkHeight) > chunkCount,
+    truncated: fullChunkCount > chunkCount,
   };
 }
 
@@ -5248,6 +5438,26 @@ app.options("/analyze", (req, res) => {
   res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type");
   res.sendStatus(204);
+});
+
+app.use("/analyze", async (req, res, next) => {
+  try {
+    await acquireAnalysisSlot();
+  } catch (error) {
+    res.status(503).json({
+      ok: false,
+      error: error.message || "Analyzeren er opptatt. Prøv igjen om litt.",
+    });
+    return;
+  }
+
+  res.on("finish", releaseAnalysisSlot);
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      releaseAnalysisSlot();
+    }
+  });
+  next();
 });
 
 app.get("/health", (req, res) => {
