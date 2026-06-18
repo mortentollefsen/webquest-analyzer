@@ -25,6 +25,8 @@ const recycleBrowserAfterUses = Math.max(1, Number(process.env.WEBQUEST_RECYCLE_
 const recycleBrowserAfterRssMb = Math.max(128, Number(process.env.WEBQUEST_RECYCLE_BROWSER_AFTER_RSS_MB || 420));
 const maxColorblindScreenshots = Math.max(1, Number(process.env.WEBQUEST_MAX_COLORBLIND_SCREENSHOTS || 6));
 const maxBrokenLinkWorkers = Math.max(1, Number(process.env.WEBQUEST_BROKEN_LINK_WORKERS || 4));
+const maxEmailDomainPages = Math.max(1, Number(process.env.WEBQUEST_EMAIL_DOMAIN_MAX_PAGES || 150));
+const maxEmailDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_EMAIL_DOMAIN_MAX_SECONDS || 90));
 const crcTable = createCrcTable();
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
@@ -4411,6 +4413,238 @@ async function getSource(url) {
   return response.text();
 }
 
+function normalizeEmail(value) {
+  const cleaned = String(value || "")
+    .replace(/^mailto:/i, "")
+    .split("?")[0]
+    .replace(/[<>()\[\],;:]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  try {
+    return decodeURIComponent(cleaned);
+  } catch {
+    return cleaned;
+  }
+}
+
+function stripHtmlText(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&#64;|&commat;/gi, "@")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractEmailsFromHtml(html, pageUrl) {
+  const source = String(html || "");
+  const emailPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  const results = [];
+  const seen = new Set();
+
+  function addEmail(item) {
+    const email = normalizeEmail(item.email);
+
+    if (!email || !/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(email)) {
+      return;
+    }
+
+    const key = `${email.toLowerCase()}|${item.source}|${item.pageUrl}`;
+
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    results.push({
+      source: item.source,
+      linkText: item.linkText || "",
+      nameSource: item.nameSource || "",
+      email,
+      href: item.href || "",
+      selector: item.selector || "",
+      pageUrl,
+    });
+  }
+
+  const mailtoPattern = /<a\b[^>]*\bhref\s*=\s*(["'])\s*mailto:([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
+
+  for (const match of source.matchAll(mailtoPattern)) {
+    const href = `mailto:${match[2] || ""}`;
+    const linkText = stripHtmlText(match[3] || "");
+    const addresses = normalizeEmail(href).split(/[;,]/).map(normalizeEmail).filter(Boolean);
+
+    addresses.forEach((email) => addEmail({
+      source: "mailto",
+      linkText,
+      nameSource: linkText ? "innhold" : "",
+      email,
+      href,
+    }));
+  }
+
+  const textWithoutMailtoLinks = source.replace(mailtoPattern, " ");
+  const text = stripHtmlText(textWithoutMailtoLinks);
+
+  for (const match of text.matchAll(emailPattern)) {
+    addEmail({
+      source: "tekst",
+      email: match[0],
+    });
+  }
+
+  return results;
+}
+
+function extractHtmlLinks(html, baseUrl, rootHost) {
+  const links = [];
+  const seen = new Set();
+  const hrefPattern = /<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1/gi;
+  const skipExtensions = /\.(?:7z|avi|bmp|css|csv|docx?|eot|gif|gz|ico|jpe?g|js|json|mp3|mp4|mpeg|odt|ogg|pdf|png|pptx?|rar|rss|svg|tar|tiff?|ttf|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i;
+
+  for (const match of html.matchAll(hrefPattern)) {
+    const rawHref = String(match[2] || "").trim();
+
+    if (!rawHref || /^(?:mailto:|tel:|javascript:|data:|sms:)/i.test(rawHref)) {
+      continue;
+    }
+
+    let href;
+
+    try {
+      href = new URL(rawHref, baseUrl);
+    } catch {
+      continue;
+    }
+
+    href.hash = "";
+
+    if (!["http:", "https:"].includes(href.protocol) || href.hostname !== rootHost) {
+      continue;
+    }
+
+    if (skipExtensions.test(href.pathname)) {
+      continue;
+    }
+
+    const value = href.href;
+
+    if (!seen.has(value)) {
+      seen.add(value);
+      links.push(value);
+    }
+  }
+
+  return links;
+}
+
+async function fetchHtmlForCrawl(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+        "Accept": "text/html,application/xhtml+xml",
+      },
+    });
+    const contentType = response.headers.get("content-type") || "";
+
+    if (!response.ok || !/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+      return { ok: false, finalUrl: response.url || url, html: "", status: response.status };
+    }
+
+    return {
+      ok: true,
+      finalUrl: response.url || url,
+      html: await response.text(),
+      status: response.status,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function crawlDomainEmails(startUrl, options = {}) {
+  const root = new URL(startUrl);
+  root.hash = "";
+  const rootHost = root.hostname;
+  const maxPages = Math.max(1, Number(options.maxPages || maxEmailDomainPages));
+  const maxSeconds = Math.max(5, Number(options.maxSeconds || maxEmailDomainSeconds));
+  const started = Date.now();
+  const queue = [root.href];
+  const queued = new Set(queue);
+  const visited = new Set();
+  const emailsByKey = new Map();
+  const errors = [];
+  let stoppedByTime = false;
+
+  while (queue.length > 0 && visited.size < maxPages) {
+    if ((Date.now() - started) / 1000 >= maxSeconds) {
+      stoppedByTime = true;
+      break;
+    }
+
+    const url = queue.shift();
+
+    if (!url || visited.has(url)) {
+      continue;
+    }
+
+    visited.add(url);
+
+    try {
+      const result = await fetchHtmlForCrawl(url);
+
+      if (!result.ok) {
+        errors.push(`${url}: HTTP ${result.status || "ukjent"}`);
+        continue;
+      }
+
+      extractEmailsFromHtml(result.html, result.finalUrl).forEach((item) => {
+        const key = `${item.email.toLowerCase()}|${item.source}|${item.pageUrl}`;
+
+        if (!emailsByKey.has(key)) {
+          emailsByKey.set(key, item);
+        }
+      });
+
+      extractHtmlLinks(result.html, result.finalUrl, rootHost).forEach((href) => {
+        if (!queued.has(href) && !visited.has(href) && queued.size < maxPages * 4) {
+          queued.add(href);
+          queue.push(href);
+        }
+      });
+    } catch (error) {
+      errors.push(`${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
+    }
+  }
+
+  return {
+    startUrl: root.href,
+    pagesChecked: visited.size,
+    pagesQueued: queue.length,
+    maxPages,
+    maxSeconds,
+    secondsUsed: Math.round((Date.now() - started) / 1000),
+    stoppedByTime,
+    truncated: queue.length > 0 || stoppedByTime,
+    emails: Array.from(emailsByKey.values()).sort((a, b) =>
+      a.email.localeCompare(b.email, "no") || a.pageUrl.localeCompare(b.pageUrl, "no")
+    ),
+    errors: errors.slice(0, 20),
+  };
+}
+
 function formatHtmlSource(source) {
   const html = String(source || "").trim();
 
@@ -5624,6 +5858,35 @@ app.get("/analyze", async (req, res) => {
       res.status(500).json({
         ok: false,
         error: friendlyErrorMessage(error, "URL-en kan ikke nås."),
+      });
+    }
+
+    return;
+  }
+
+  if (command === "emailsdomain") {
+    if (!requestedUrl) {
+      res.status(400).json({
+        ok: false,
+        error: 'Du må angi en URL eller velge en standard URL med kommandoen "Velg URL".',
+      });
+      return;
+    }
+
+    try {
+      const url = await validatePublicUrl(requestedUrl);
+      const result = await crawlDomainEmails(url);
+
+      res.json({
+        ok: true,
+        engine: "fetch-crawler",
+        url,
+        emailDomain: result,
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: friendlyErrorMessage(error, "Jeg fikk ikke crawlet domenet."),
       });
     }
 
