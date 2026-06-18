@@ -4845,9 +4845,22 @@ function extractFormsFromHtml(html, pageUrl) {
   });
 }
 
-function extractHtmlLinks(html, baseUrl, rootHost) {
+function hostVariants(hostname) {
+  const host = String(hostname || "").toLowerCase();
+
+  if (!host) {
+    return [];
+  }
+
+  return host.startsWith("www.")
+    ? [host, host.slice(4)]
+    : [host, `www.${host}`];
+}
+
+function extractHtmlLinks(html, baseUrl, allowedHosts) {
   const links = [];
   const seen = new Set();
+  const hosts = allowedHosts instanceof Set ? allowedHosts : new Set(hostVariants(allowedHosts));
   const hrefPattern = /<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1/gi;
   const skipExtensions = /\.(?:7z|avi|bmp|css|csv|docx?|eot|gif|gz|ico|jpe?g|js|json|mp3|mp4|mpeg|odt|ogg|pdf|png|pptx?|rar|rss|svg|tar|tiff?|ttf|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i;
 
@@ -4868,7 +4881,7 @@ function extractHtmlLinks(html, baseUrl, rootHost) {
 
     href.hash = "";
 
-    if (!["http:", "https:"].includes(href.protocol) || href.hostname !== rootHost) {
+    if (!["http:", "https:"].includes(href.protocol) || !hosts.has(href.hostname.toLowerCase())) {
       continue;
     }
 
@@ -4885,6 +4898,156 @@ function extractHtmlLinks(html, baseUrl, rootHost) {
   }
 
   return links;
+}
+
+function extractLinksForBrokenCheck(html, baseUrl) {
+  const links = [];
+  const seen = new Set();
+  const anchorTargets = new Set();
+
+  for (const match of String(html || "").matchAll(/\bid\s*=\s*(["'])([\s\S]*?)\1/gi)) {
+    anchorTargets.add(decodeHtmlEntities(match[2] || ""));
+  }
+
+  for (const match of String(html || "").matchAll(/<a\b[^>]*\bname\s*=\s*(["'])([\s\S]*?)\1/gi)) {
+    anchorTargets.add(decodeHtmlEntities(match[2] || ""));
+  }
+
+  for (const match of String(html || "").matchAll(/<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a>|<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\4[^>]*>/gi)) {
+    const rawHref = String(match[2] || match[5] || "").trim();
+
+    if (!rawHref) {
+      continue;
+    }
+
+    let href;
+
+    try {
+      href = new URL(rawHref, baseUrl).href;
+    } catch {
+      href = rawHref;
+    }
+
+    const text = stripTags(match[3] || "");
+    const key = href;
+
+    if (!seen.has(key)) {
+      seen.add(key);
+      links.push({
+        href,
+        name: text,
+      });
+    }
+  }
+
+  return { links, anchorTargets };
+}
+
+async function checkCrawlHttpLink(link) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    let response = await fetch(link.href, {
+      method: "HEAD",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+      },
+    });
+
+    if ([403, 405, 501].includes(response.status)) {
+      response = await fetch(link.href, {
+        method: "GET",
+        redirect: "follow",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+        },
+      });
+    }
+
+    if (response.status >= 400) {
+      return {
+        ...link,
+        reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
+      };
+    }
+
+    return null;
+  } catch (error) {
+    return {
+      ...link,
+      reason: error.name === "AbortError" ? "Tidsavbrudd" : "Kunne ikke nå lenken",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function extractBrokenLinksFromHtml(html, pageUrl) {
+  const { links, anchorTargets } = extractLinksForBrokenCheck(html, pageUrl);
+  const pageUrlWithoutHash = new URL(pageUrl);
+  const broken = [];
+
+  pageUrlWithoutHash.hash = "";
+
+  for (const link of links.slice(0, 80)) {
+    let parsed;
+
+    try {
+      parsed = new URL(link.href, pageUrl);
+    } catch {
+      broken.push({ ...link, reason: "Ugyldig URL", pageUrl });
+      continue;
+    }
+
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      continue;
+    }
+
+    const withoutHash = new URL(parsed.href);
+    withoutHash.hash = "";
+
+    if (withoutHash.href === pageUrlWithoutHash.href && parsed.hash) {
+      let target = parsed.hash.slice(1);
+
+      try {
+        target = decodeURIComponent(target);
+      } catch {
+      }
+
+      if (target && !anchorTargets.has(target)) {
+        broken.push({
+          ...link,
+          href: parsed.href,
+          reason: `Mangler anker: #${target}`,
+          pageUrl,
+        });
+      }
+
+      continue;
+    }
+
+    try {
+      await validatePublicUrl(parsed.href);
+    } catch {
+      continue;
+    }
+
+    const brokenLink = await checkCrawlHttpLink({
+      ...link,
+      href: parsed.href,
+      pageUrl,
+    });
+
+    if (brokenLink) {
+      broken.push(brokenLink);
+    }
+  }
+
+  return broken;
 }
 
 async function fetchHtmlForCrawl(url, options = {}) {
@@ -4935,6 +5098,10 @@ const domainExtractors = {
     label: "Skjemaer",
     extract: extractFormsFromHtml,
   },
+  brokenlinks: {
+    label: "Brutte lenker",
+    extract: extractBrokenLinksFromHtml,
+  },
 };
 
 function normalizeDomainPageCount(value) {
@@ -4977,7 +5144,7 @@ function finalizeDomainResult(result, started, queueLength = 0) {
 async function crawlDomain(startUrl, type, options = {}) {
   const root = new URL(startUrl);
   root.hash = "";
-  const rootHost = root.hostname;
+  const allowedHosts = new Set(hostVariants(root.hostname));
   const extractor = domainExtractors[type];
   const maxPages = normalizeDomainPageCount(options.maxPages);
   const maxSeconds = Math.max(5, Number(options.maxSeconds || maxDomainSeconds));
@@ -5031,7 +5198,12 @@ async function crawlDomain(startUrl, type, options = {}) {
         continue;
       }
 
-      const items = extractor.extract(pageResult.html, pageResult.finalUrl);
+      try {
+        hostVariants(new URL(pageResult.finalUrl).hostname).forEach((host) => allowedHosts.add(host));
+      } catch {
+      }
+
+      const items = await extractor.extract(pageResult.html, pageResult.finalUrl);
 
       if (items.length) {
         result.pages.push({
@@ -5041,7 +5213,7 @@ async function crawlDomain(startUrl, type, options = {}) {
         });
       }
 
-      extractHtmlLinks(pageResult.html, pageResult.finalUrl, rootHost).forEach((href) => {
+      extractHtmlLinks(pageResult.html, pageResult.finalUrl, allowedHosts).forEach((href) => {
         if (!queued.has(href) && !visited.has(href) && queued.size < maxPages * 4) {
           queued.add(href);
           queue.push(href);
