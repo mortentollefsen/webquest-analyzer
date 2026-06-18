@@ -27,7 +27,8 @@ const maxColorblindScreenshots = Math.max(1, Number(process.env.WEBQUEST_MAX_COL
 const maxBrokenLinkWorkers = Math.max(1, Number(process.env.WEBQUEST_BROKEN_LINK_WORKERS || 4));
 const defaultDomainPages = Math.max(1, Number(process.env.WEBQUEST_DOMAIN_DEFAULT_PAGES || 150));
 const maxDomainPages = Math.max(defaultDomainPages, Number(process.env.WEBQUEST_DOMAIN_MAX_PAGES || 1000));
-const maxDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_DOMAIN_MAX_SECONDS || 300));
+const defaultDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_DOMAIN_DEFAULT_SECONDS || 300));
+const maxDomainSeconds = Math.max(defaultDomainSeconds, Number(process.env.WEBQUEST_DOMAIN_MAX_SECONDS || 28800));
 const domainJobTtlMs = Math.max(60000, Number(process.env.WEBQUEST_DOMAIN_JOB_TTL_MS || 600000));
 const domainJobs = new Map();
 const crcTable = createCrcTable();
@@ -5122,7 +5123,7 @@ function emptyDomainResult(type, startUrl, maxPages = defaultDomainPages) {
     pagesChecked: 0,
     pagesQueued: 0,
     maxPages,
-    maxSeconds: maxDomainSeconds,
+    maxSeconds: defaultDomainSeconds,
     secondsUsed: 0,
     stoppedByTime: false,
     aborted: false,
@@ -5147,11 +5148,12 @@ async function crawlDomain(startUrl, type, options = {}) {
   const allowedHosts = new Set(hostVariants(root.hostname));
   const extractor = domainExtractors[type];
   const maxPages = normalizeDomainPageCount(options.maxPages);
-  const maxSeconds = Math.max(5, Number(options.maxSeconds || maxDomainSeconds));
+  const maxSeconds = Math.max(5, Number(options.maxSeconds || defaultDomainSeconds));
   const started = Date.now();
   const queue = [root.href];
   const queued = new Set(queue);
   const visited = new Set();
+  const seenBrokenLinks = new Set();
   const result = options.job?.result || emptyDomainResult(type, root.href, maxPages);
 
   result.maxSeconds = maxSeconds;
@@ -5203,7 +5205,20 @@ async function crawlDomain(startUrl, type, options = {}) {
       } catch {
       }
 
-      const items = await extractor.extract(pageResult.html, pageResult.finalUrl);
+      let items = await extractor.extract(pageResult.html, pageResult.finalUrl);
+
+      if (type === "brokenlinks") {
+        items = items.filter((item) => {
+          const key = `${String(item.href || "").toLowerCase()}|${item.reason || ""}`;
+
+          if (seenBrokenLinks.has(key)) {
+            return false;
+          }
+
+          seenBrokenLinks.add(key);
+          return true;
+        });
+      }
 
       if (items.length) {
         result.pages.push({
@@ -5255,11 +5270,22 @@ function cleanupDomainJobs() {
   });
 }
 
-function startDomainJob({ type, url, maxPages }) {
+function normalizeDomainSeconds(value) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return defaultDomainSeconds;
+  }
+
+  return Math.min(Math.max(5, parsed), maxDomainSeconds);
+}
+
+function startDomainJob({ type, url, maxPages, maxSeconds }) {
   cleanupDomainJobs();
 
   const id = crypto.randomUUID();
   const safeMaxPages = normalizeDomainPageCount(maxPages);
+  const safeMaxSeconds = normalizeDomainSeconds(maxSeconds);
   const job = {
     id,
     command: `${type}domain`,
@@ -5273,12 +5299,12 @@ function startDomainJob({ type, url, maxPages }) {
     result: emptyDomainResult(type, url, safeMaxPages),
   };
 
-  job.result.maxSeconds = maxDomainSeconds;
+  job.result.maxSeconds = safeMaxSeconds;
   domainJobs.set(id, job);
 
   crawlDomain(url, type, {
     maxPages: safeMaxPages,
-    maxSeconds: maxDomainSeconds,
+    maxSeconds: safeMaxSeconds,
     job,
   })
     .then((result) => {
@@ -6562,6 +6588,7 @@ app.get("/analyze", async (req, res) => {
     try {
       const type = String(req.query.type || "").trim().toLowerCase();
       const maxPages = normalizeDomainPageCount(req.query.maxPages);
+      const maxSeconds = normalizeDomainSeconds(req.query.maxSeconds);
 
       if (!domainExtractors[type]) {
         res.status(400).json({ ok: false, error: "Ukjent domenejobb." });
@@ -6569,7 +6596,7 @@ app.get("/analyze", async (req, res) => {
       }
 
       const url = await validatePublicUrl(requestedUrl);
-      const job = startDomainJob({ type, url, maxPages });
+      const job = startDomainJob({ type, url, maxPages, maxSeconds });
 
       res.json({
         ok: true,
