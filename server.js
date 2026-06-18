@@ -1337,6 +1337,99 @@ function collectAccessibilityData(mode) {
     return { links, issues };
   }
 
+  if (mode === "emails") {
+    const emailPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+    const emailTestPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+    const seen = new Set();
+    const emails = [];
+
+    function cleanEmail(value) {
+      const cleaned = normalized(String(value || "")
+        .replace(/^mailto:/i, "")
+        .split("?")[0]
+        .replace(/[<>()\[\],;:]+$/g, ""));
+
+      try {
+        return decodeURIComponent(cleaned);
+      } catch {
+        return cleaned;
+      }
+    }
+
+    function addEmail(item) {
+      const email = cleanEmail(item.email);
+
+      if (!email || !emailPattern.test(email)) {
+        emailPattern.lastIndex = 0;
+        return;
+      }
+
+      emailPattern.lastIndex = 0;
+      const key = `${email.toLowerCase()}|${item.source}|${item.selector || ""}`;
+
+      if (seen.has(key)) {
+        return;
+      }
+
+      seen.add(key);
+      emails.push({
+        ...item,
+        email,
+      });
+    }
+
+    Array.from(document.querySelectorAll("a[href^='mailto:'], a[href^='MAILTO:']")).forEach((link) => {
+      const name = accessibleName(link);
+      const href = link.getAttribute("href") || "";
+      const addresses = cleanEmail(href).split(/[;,]/).map(cleanEmail).filter(Boolean);
+
+      addresses.forEach((email) => {
+        addEmail({
+          source: "mailto",
+          linkText: name.value,
+          nameSource: name.source,
+          email,
+          href,
+          selector: selectorFor(link),
+        });
+      });
+    });
+
+    const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+
+        if (!parent || isHidden(parent) || parent.closest("script, style, noscript, textarea, input, a[href^='mailto:'], a[href^='MAILTO:']")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+
+      return emailTestPattern.test(node.textContent || "")
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_REJECT;
+      },
+    });
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const parent = node.parentElement;
+      const text = node.textContent || "";
+      const matches = text.match(emailPattern) || [];
+
+      matches.forEach((email) => {
+        addEmail({
+          source: "tekst",
+          linkText: "",
+          nameSource: "",
+          email,
+          href: "",
+          selector: selectorFor(parent),
+        });
+      });
+    }
+
+    return { emails };
+  }
+
   if (mode === "images") {
     function svgPreviewDataUrl(element) {
       if (element.tagName.toLowerCase() !== "svg") {
@@ -5256,6 +5349,16 @@ const analyzers = {
   }),
   links: async (page, url) => {
     const result = await getLinks(page);
+
+    return {
+      ok: true,
+      engine: "playwright",
+      url,
+      ...result,
+    };
+  },
+  emails: async (page, url) => {
+    const result = await page.evaluate(collectAccessibilityData, "emails");
 
     return {
       ok: true,
