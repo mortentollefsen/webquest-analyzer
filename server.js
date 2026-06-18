@@ -25,8 +25,11 @@ const recycleBrowserAfterUses = Math.max(1, Number(process.env.WEBQUEST_RECYCLE_
 const recycleBrowserAfterRssMb = Math.max(128, Number(process.env.WEBQUEST_RECYCLE_BROWSER_AFTER_RSS_MB || 420));
 const maxColorblindScreenshots = Math.max(1, Number(process.env.WEBQUEST_MAX_COLORBLIND_SCREENSHOTS || 6));
 const maxBrokenLinkWorkers = Math.max(1, Number(process.env.WEBQUEST_BROKEN_LINK_WORKERS || 4));
-const maxEmailDomainPages = Math.max(1, Number(process.env.WEBQUEST_EMAIL_DOMAIN_MAX_PAGES || 150));
-const maxEmailDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_EMAIL_DOMAIN_MAX_SECONDS || 90));
+const defaultDomainPages = Math.max(1, Number(process.env.WEBQUEST_DOMAIN_DEFAULT_PAGES || 150));
+const maxDomainPages = Math.max(defaultDomainPages, Number(process.env.WEBQUEST_DOMAIN_MAX_PAGES || 1000));
+const maxDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_DOMAIN_MAX_SECONDS || 300));
+const domainJobTtlMs = Math.max(60000, Number(process.env.WEBQUEST_DOMAIN_JOB_TTL_MS || 600000));
+const domainJobs = new Map();
 const crcTable = createCrcTable();
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
@@ -3053,6 +3056,139 @@ async function getTables(page) {
   });
 }
 
+async function getVideos(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    function providerFromUrl(url) {
+      const value = String(url || "");
+
+      if (/youtube(?:-nocookie)?\.com|youtu\.be/i.test(value)) return "YouTube";
+      if (/vimeo\.com/i.test(value)) return "Vimeo";
+      if (/facebook\.com\/plugins\/video|fb\.watch/i.test(value)) return "Facebook";
+      if (/wistia\.com|wistia\.net/i.test(value)) return "Wistia";
+      if (/kaltura/i.test(value)) return "Kaltura";
+      if (/brightcove|bcove/i.test(value)) return "Brightcove";
+      if (/\.(mp4|webm|ogg|ogv|mov|m3u8)(?:[?#]|$)/i.test(value)) return "Videofil";
+      return "";
+    }
+
+    const videos = [];
+    const seen = new Set();
+
+    function addVideo(item) {
+      const key = `${item.type}|${item.src}|${item.title}`;
+
+      if (seen.has(key) || (!item.src && !item.title)) {
+        return;
+      }
+
+      seen.add(key);
+      videos.push(item);
+    }
+
+    document.querySelectorAll("video").forEach((video) => {
+      const sources = [
+        video.currentSrc || video.src || video.getAttribute("src") || "",
+        ...Array.from(video.querySelectorAll("source")).map((source) => source.src || source.getAttribute("src") || ""),
+      ].filter(Boolean);
+
+      (sources.length ? sources : [""]).forEach((src) => addVideo({
+        type: "video",
+        provider: providerFromUrl(src) || "HTML video",
+        title: normalized(video.getAttribute("title") || video.getAttribute("aria-label") || video.getAttribute("poster")),
+        src,
+        selector: selectorFor(video),
+      }));
+    });
+
+    document.querySelectorAll("iframe, embed, object").forEach((element) => {
+      const src = element.src || element.data || element.getAttribute("src") || element.getAttribute("data") || "";
+      const provider = providerFromUrl(src);
+
+      if (provider || /video|player|embed/i.test(src)) {
+        addVideo({
+          type: element.tagName.toLowerCase(),
+          provider: provider || "embed",
+          title: normalized(element.getAttribute("title") || element.getAttribute("aria-label")),
+          src,
+          selector: selectorFor(element),
+        });
+      }
+    });
+
+    document.querySelectorAll("a[href]").forEach((link) => {
+      const href = link.href || link.getAttribute("href") || "";
+      const provider = providerFromUrl(href);
+
+      if (provider) {
+        addVideo({
+          type: "lenke",
+          provider,
+          title: normalized(link.innerText || link.textContent || link.getAttribute("aria-label")),
+          src: href,
+          selector: selectorFor(link),
+        });
+      }
+    });
+
+    return videos;
+  });
+}
+
+async function getForms(page) {
+  return page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    function fieldName(element) {
+      return normalized(
+        element.getAttribute("aria-label") ||
+        element.getAttribute("name") ||
+        element.id ||
+        element.getAttribute("value") ||
+        element.innerText ||
+        element.textContent
+      );
+    }
+
+    return Array.from(document.querySelectorAll("form")).map((form, index) => {
+      const fields = Array.from(form.querySelectorAll("input, select, textarea, button")).map((field) => ({
+        type: field.getAttribute("type") || field.tagName.toLowerCase(),
+        name: fieldName(field),
+      }));
+
+      return {
+        index: index + 1,
+        action: form.action || form.getAttribute("action") || "",
+        method: (form.method || form.getAttribute("method") || "get").toLowerCase(),
+        fieldCount: fields.length,
+        fields: fields.slice(0, 12),
+        selector: selectorFor(form),
+      };
+    });
+  });
+}
+
 async function getIframes(page) {
   return page.evaluate(collectAccessibilityData, "iframes");
 
@@ -4441,6 +4577,61 @@ function stripHtmlText(html) {
     .trim();
 }
 
+function stripTags(html) {
+  return stripHtmlText(html);
+}
+
+function decodeHtmlEntities(text) {
+  return String(text || "")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#(\d+);/g, (_, code) => {
+      const value = Number(code);
+      return Number.isFinite(value) ? String.fromCodePoint(value) : "";
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => {
+      const value = Number.parseInt(code, 16);
+      return Number.isFinite(value) ? String.fromCodePoint(value) : "";
+    });
+}
+
+function attributesFromHtml(tag) {
+  const attributes = {};
+  const source = String(tag || "");
+  const pattern = /([:\w-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+
+  while ((match = pattern.exec(source))) {
+    const name = match[1].toLowerCase();
+
+    if (name === source.split(/\s+/)[0]?.replace(/^</, "").toLowerCase()) {
+      continue;
+    }
+
+    attributes[name] = decodeHtmlEntities(match[2] ?? match[3] ?? match[4] ?? "");
+  }
+
+  return attributes;
+}
+
+function absoluteUrl(value, baseUrl) {
+  const raw = String(value || "").trim();
+
+  if (!raw) {
+    return "";
+  }
+
+  try {
+    return new URL(raw, baseUrl).href;
+  } catch {
+    return raw;
+  }
+}
+
 function extractEmailsFromHtml(html, pageUrl) {
   const source = String(html || "");
   const emailPattern = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
@@ -4501,6 +4692,159 @@ function extractEmailsFromHtml(html, pageUrl) {
   return results;
 }
 
+function providerFromUrl(url) {
+  const value = String(url || "");
+
+  if (/youtube(?:-nocookie)?\.com|youtu\.be/i.test(value)) return "YouTube";
+  if (/vimeo\.com/i.test(value)) return "Vimeo";
+  if (/player\.vimeo\.com/i.test(value)) return "Vimeo";
+  if (/facebook\.com\/plugins\/video|fb\.watch/i.test(value)) return "Facebook";
+  if (/wistia\.com|wistia\.net/i.test(value)) return "Wistia";
+  if (/kaltura/i.test(value)) return "Kaltura";
+  if (/brightcove|bcove/i.test(value)) return "Brightcove";
+  if (/\.(mp4|webm|ogg|ogv|mov|m3u8)(?:[?#]|$)/i.test(value)) return "Videofil";
+  return "";
+}
+
+function extractVideosFromHtml(html, pageUrl) {
+  const source = String(html || "");
+  const videos = [];
+  const seen = new Set();
+
+  function addVideo(item) {
+    const src = String(item.src || "").trim();
+    const title = stripTags(item.title || "");
+    const key = `${item.type}|${src}|${title}`;
+
+    if (!src && !title) {
+      return;
+    }
+
+    if (seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    videos.push({
+      type: item.type || "video",
+      provider: item.provider || providerFromUrl(src) || "ukjent",
+      title,
+      src,
+      pageUrl,
+    });
+  }
+
+  for (const match of source.matchAll(/<video\b[\s\S]*?<\/video>|<video\b[^>]*>/gi)) {
+    const block = match[0];
+    const attrs = attributesFromHtml(block);
+    const sources = [];
+
+    if (attrs.src) {
+      sources.push(attrs.src);
+    }
+
+    for (const sourceMatch of block.matchAll(/<source\b[^>]*>/gi)) {
+      const sourceAttrs = attributesFromHtml(sourceMatch[0]);
+      if (sourceAttrs.src) {
+        sources.push(sourceAttrs.src);
+      }
+    }
+
+    if (!sources.length) {
+      sources.push("");
+    }
+
+    sources.forEach((src) => {
+      const absoluteSrc = absoluteUrl(src, pageUrl);
+      addVideo({
+        type: "video",
+        provider: providerFromUrl(absoluteSrc) || "HTML video",
+        title: attrs.title || attrs["aria-label"] || attrs.poster || "",
+        src: absoluteSrc,
+      });
+    });
+  }
+
+  for (const match of source.matchAll(/<(iframe|embed|object)\b[^>]*>/gi)) {
+    const attrs = attributesFromHtml(match[0]);
+    const rawSrc = attrs.src || attrs.data || "";
+    const src = absoluteUrl(rawSrc, pageUrl);
+    const provider = providerFromUrl(src);
+
+    if (provider || /video|player|embed/i.test(src)) {
+      addVideo({
+        type: match[1].toLowerCase(),
+        provider: provider || "embed",
+        title: attrs.title || attrs["aria-label"] || "",
+        src,
+      });
+    }
+  }
+
+  for (const match of source.matchAll(/https?:\/\/[^\s"'<>]+\.(?:mp4|webm|ogg|ogv|mov|m3u8)(?:[?#][^\s"'<>]*)?/gi)) {
+    addVideo({
+      type: "lenke",
+      provider: "Videofil",
+      title: "",
+      src: match[0],
+    });
+  }
+
+  return videos;
+}
+
+function extractTablesFromHtml(html, pageUrl) {
+  return Array.from(String(html || "").matchAll(/<table\b[\s\S]*?<\/table>/gi)).map((match, index) => {
+    const table = match[0];
+    const captionMatch = table.match(/<caption\b[^>]*>([\s\S]*?)<\/caption>/i);
+    const rows = (table.match(/<tr\b/gi) || []).length;
+    const headerCells = (table.match(/<th\b/gi) || []).length;
+    const firstRows = Array.from(table.matchAll(/<tr\b[\s\S]*?<\/tr>/gi)).slice(0, 8);
+    const columns = firstRows.reduce((max, rowMatch) => {
+      const count = (rowMatch[0].match(/<(?:td|th)\b/gi) || []).length;
+      return Math.max(max, count);
+    }, 0);
+
+    return {
+      pageUrl,
+      index: index + 1,
+      caption: captionMatch ? stripTags(captionMatch[1]) : "",
+      rows,
+      columns,
+      headerCells,
+      missingCaption: !captionMatch,
+      missingScope: /<th\b(?![^>]*\bscope\s*=)/i.test(table),
+      possibleLayout: headerCells === 0 && !captionMatch,
+    };
+  });
+}
+
+function extractFormsFromHtml(html, pageUrl) {
+  return Array.from(String(html || "").matchAll(/<form\b[\s\S]*?<\/form>/gi)).map((match, index) => {
+    const form = match[0];
+    const attrs = attributesFromHtml(form);
+    const fields = [];
+
+    for (const fieldMatch of form.matchAll(/<(input|select|textarea|button)\b[^>]*>/gi)) {
+      const tag = fieldMatch[1].toLowerCase();
+      const fieldAttrs = attributesFromHtml(fieldMatch[0]);
+      fields.push({
+        type: fieldAttrs.type || tag,
+        name: fieldAttrs.name || fieldAttrs.id || fieldAttrs["aria-label"] || fieldAttrs.value || "",
+      });
+    }
+
+    return {
+      pageUrl,
+      index: index + 1,
+      action: absoluteUrl(attrs.action, pageUrl),
+      method: (attrs.method || "get").toLowerCase(),
+      fieldCount: fields.length,
+      fields: fields.slice(0, 12),
+    };
+  });
+}
+
 function extractHtmlLinks(html, baseUrl, rootHost) {
   const links = [];
   const seen = new Set();
@@ -4543,8 +4887,8 @@ function extractHtmlLinks(html, baseUrl, rootHost) {
   return links;
 }
 
-async function fetchHtmlForCrawl(url) {
-  const controller = new AbortController();
+async function fetchHtmlForCrawl(url, options = {}) {
+  const controller = options.controller || new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
@@ -4574,23 +4918,89 @@ async function fetchHtmlForCrawl(url) {
   }
 }
 
-async function crawlDomainEmails(startUrl, options = {}) {
+const domainExtractors = {
+  emails: {
+    label: "E-postadresser",
+    extract: extractEmailsFromHtml,
+  },
+  videos: {
+    label: "Videoer",
+    extract: extractVideosFromHtml,
+  },
+  tables: {
+    label: "Tabeller",
+    extract: extractTablesFromHtml,
+  },
+  forms: {
+    label: "Skjemaer",
+    extract: extractFormsFromHtml,
+  },
+};
+
+function normalizeDomainPageCount(value) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return defaultDomainPages;
+  }
+
+  return Math.min(parsed, maxDomainPages);
+}
+
+function emptyDomainResult(type, startUrl, maxPages = defaultDomainPages) {
+  return {
+    type,
+    label: domainExtractors[type]?.label || type,
+    startUrl,
+    pagesChecked: 0,
+    pagesQueued: 0,
+    maxPages,
+    maxSeconds: maxDomainSeconds,
+    secondsUsed: 0,
+    stoppedByTime: false,
+    aborted: false,
+    truncated: false,
+    totalFindings: 0,
+    pages: [],
+    errors: [],
+  };
+}
+
+function finalizeDomainResult(result, started, queueLength = 0) {
+  result.pagesQueued = queueLength;
+  result.secondsUsed = Math.round((Date.now() - started) / 1000);
+  result.totalFindings = result.pages.reduce((sum, page) => sum + (page.count || 0), 0);
+  result.truncated = queueLength > 0 || result.stoppedByTime || result.pagesChecked >= result.maxPages;
+  return result;
+}
+
+async function crawlDomain(startUrl, type, options = {}) {
   const root = new URL(startUrl);
   root.hash = "";
   const rootHost = root.hostname;
-  const maxPages = Math.max(1, Number(options.maxPages || maxEmailDomainPages));
-  const maxSeconds = Math.max(5, Number(options.maxSeconds || maxEmailDomainSeconds));
+  const extractor = domainExtractors[type];
+  const maxPages = normalizeDomainPageCount(options.maxPages);
+  const maxSeconds = Math.max(5, Number(options.maxSeconds || maxDomainSeconds));
   const started = Date.now();
   const queue = [root.href];
   const queued = new Set(queue);
   const visited = new Set();
-  const emailsByKey = new Map();
-  const errors = [];
-  let stoppedByTime = false;
+  const result = options.job?.result || emptyDomainResult(type, root.href, maxPages);
+
+  result.maxSeconds = maxSeconds;
+
+  if (!extractor) {
+    throw new Error("Ukjent domenejobb.");
+  }
 
   while (queue.length > 0 && visited.size < maxPages) {
+    if (options.job?.cancelled) {
+      result.aborted = true;
+      break;
+    }
+
     if ((Date.now() - started) / 1000 >= maxSeconds) {
-      stoppedByTime = true;
+      result.stoppedByTime = true;
       break;
     }
 
@@ -4601,48 +5011,140 @@ async function crawlDomainEmails(startUrl, options = {}) {
     }
 
     visited.add(url);
+    result.pagesChecked = visited.size;
 
     try {
-      const result = await fetchHtmlForCrawl(url);
+      const controller = new AbortController();
 
-      if (!result.ok) {
-        errors.push(`${url}: HTTP ${result.status || "ukjent"}`);
+      if (options.job) {
+        options.job.currentController = controller;
+      }
+
+      const pageResult = await fetchHtmlForCrawl(url, { controller });
+
+      if (options.job) {
+        options.job.currentController = null;
+      }
+
+      if (!pageResult.ok) {
+        result.errors.push(`${url}: HTTP ${pageResult.status || "ukjent"}`);
         continue;
       }
 
-      extractEmailsFromHtml(result.html, result.finalUrl).forEach((item) => {
-        const key = `${item.email.toLowerCase()}|${item.source}|${item.pageUrl}`;
+      const items = extractor.extract(pageResult.html, pageResult.finalUrl);
 
-        if (!emailsByKey.has(key)) {
-          emailsByKey.set(key, item);
-        }
-      });
+      if (items.length) {
+        result.pages.push({
+          url: pageResult.finalUrl,
+          count: items.length,
+          items,
+        });
+      }
 
-      extractHtmlLinks(result.html, result.finalUrl, rootHost).forEach((href) => {
+      extractHtmlLinks(pageResult.html, pageResult.finalUrl, rootHost).forEach((href) => {
         if (!queued.has(href) && !visited.has(href) && queued.size < maxPages * 4) {
           queued.add(href);
           queue.push(href);
         }
       });
     } catch (error) {
-      errors.push(`${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
+      if (options.job) {
+        options.job.currentController = null;
+      }
+
+      result.errors.push(`${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
     }
+
+    finalizeDomainResult(result, started, queue.length);
   }
 
+  return finalizeDomainResult(result, started, queue.length);
+}
+
+function publicDomainJob(job) {
   return {
-    startUrl: root.href,
-    pagesChecked: visited.size,
-    pagesQueued: queue.length,
-    maxPages,
-    maxSeconds,
-    secondsUsed: Math.round((Date.now() - started) / 1000),
-    stoppedByTime,
-    truncated: queue.length > 0 || stoppedByTime,
-    emails: Array.from(emailsByKey.values()).sort((a, b) =>
-      a.email.localeCompare(b.email, "no") || a.pageUrl.localeCompare(b.pageUrl, "no")
-    ),
-    errors: errors.slice(0, 20),
+    jobId: job.id,
+    status: job.status,
+    command: job.command,
+    type: job.type,
+    done: ["completed", "cancelled", "failed"].includes(job.status),
+    error: job.error || "",
+    result: job.result,
   };
+}
+
+function cleanupDomainJobs() {
+  const now = Date.now();
+
+  domainJobs.forEach((job, id) => {
+    if (["completed", "cancelled", "failed"].includes(job.status) && now - job.finishedAt > domainJobTtlMs) {
+      domainJobs.delete(id);
+    }
+  });
+}
+
+function startDomainJob({ type, url, maxPages }) {
+  cleanupDomainJobs();
+
+  const id = crypto.randomUUID();
+  const safeMaxPages = normalizeDomainPageCount(maxPages);
+  const job = {
+    id,
+    command: `${type}domain`,
+    type,
+    status: "running",
+    cancelled: false,
+    currentController: null,
+    startedAt: Date.now(),
+    finishedAt: 0,
+    error: "",
+    result: emptyDomainResult(type, url, safeMaxPages),
+  };
+
+  job.result.maxSeconds = maxDomainSeconds;
+  domainJobs.set(id, job);
+
+  crawlDomain(url, type, {
+    maxPages: safeMaxPages,
+    maxSeconds: maxDomainSeconds,
+    job,
+  })
+    .then((result) => {
+      job.result = result;
+      job.status = job.cancelled ? "cancelled" : "completed";
+    })
+    .catch((error) => {
+      job.status = job.cancelled ? "cancelled" : "failed";
+      job.error = friendlyErrorMessage(error, "Domenejobben feilet.");
+      job.result.aborted = job.cancelled;
+    })
+    .finally(() => {
+      job.finishedAt = Date.now();
+      job.currentController = null;
+      finalizeDomainResult(job.result, job.startedAt, job.result.pagesQueued || 0);
+    });
+
+  return job;
+}
+
+function cancelDomainJob(jobId) {
+  const job = domainJobs.get(jobId);
+
+  if (!job) {
+    return null;
+  }
+
+  job.cancelled = true;
+  job.status = "cancelled";
+  job.finishedAt = Date.now();
+  job.result.aborted = true;
+
+  if (job.currentController) {
+    job.currentController.abort();
+  }
+
+  finalizeDomainResult(job.result, job.startedAt, job.result.pagesQueued || 0);
+  return job;
 }
 
 function formatHtmlSource(source) {
@@ -5601,6 +6103,18 @@ const analyzers = {
       ...result,
     };
   },
+  videos: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    videos: await getVideos(page),
+  }),
+  forms: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    forms: await getForms(page),
+  }),
   brokenlinks: async (page, url) => ({
     ok: true,
     engine: "playwright",
@@ -5864,7 +6378,7 @@ app.get("/analyze", async (req, res) => {
     return;
   }
 
-  if (command === "emailsdomain") {
+  if (command === "startdomainjob") {
     if (!requestedUrl) {
       res.status(400).json({
         ok: false,
@@ -5874,22 +6388,64 @@ app.get("/analyze", async (req, res) => {
     }
 
     try {
+      const type = String(req.query.type || "").trim().toLowerCase();
+      const maxPages = normalizeDomainPageCount(req.query.maxPages);
+
+      if (!domainExtractors[type]) {
+        res.status(400).json({ ok: false, error: "Ukjent domenejobb." });
+        return;
+      }
+
       const url = await validatePublicUrl(requestedUrl);
-      const result = await crawlDomainEmails(url);
+      const job = startDomainJob({ type, url, maxPages });
 
       res.json({
         ok: true,
-        engine: "fetch-crawler",
+        engine: "fetch-crawler-job",
         url,
-        emailDomain: result,
+        ...publicDomainJob(job),
       });
     } catch (error) {
       res.status(500).json({
         ok: false,
-        error: friendlyErrorMessage(error, "Jeg fikk ikke crawlet domenet."),
+        error: friendlyErrorMessage(error, "Jeg fikk ikke startet domenejobben."),
       });
     }
 
+    return;
+  }
+
+  if (command === "domainjobstatus") {
+    const jobId = String(req.query.jobId || "").trim();
+    const job = domainJobs.get(jobId);
+
+    if (!job) {
+      res.status(404).json({ ok: false, error: "Domenejobben finnes ikke lenger." });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      engine: "fetch-crawler-job",
+      ...publicDomainJob(job),
+    });
+    return;
+  }
+
+  if (command === "canceldomainjob") {
+    const jobId = String(req.query.jobId || "").trim();
+    const job = cancelDomainJob(jobId);
+
+    if (!job) {
+      res.status(404).json({ ok: false, error: "Domenejobben finnes ikke lenger." });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      engine: "fetch-crawler-job",
+      ...publicDomainJob(job),
+    });
     return;
   }
 
