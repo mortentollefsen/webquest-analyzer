@@ -2323,7 +2323,7 @@ async function getLinks(page) {
   });
 }
 
-async function getBrokenLinks(page, pageUrl) {
+async function getBrokenLinks(page, pageUrl, options = {}) {
   const linkResult = await getLinks(page);
   const links = linkResult.links || [];
   const anchors = await page.evaluate(() => {
@@ -2374,7 +2374,7 @@ async function getBrokenLinks(page, pageUrl) {
         statusText: response.statusText || "",
       });
 
-      if (response.status >= 400) {
+      if (response.status >= 400 && !(options.ignore403 && response.status === 403)) {
         broken.push({
           ...link,
           reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
@@ -6313,11 +6313,11 @@ const analyzers = {
     url,
     forms: await getForms(page),
   }),
-  brokenlinks: async (page, url) => ({
+  brokenlinks: async (page, url, options = {}) => ({
     ok: true,
     engine: "playwright",
     url,
-    brokenLinks: await getBrokenLinks(page, url),
+    brokenLinks: await getBrokenLinks(page, url, options),
   }),
   images: async (page, url) => ({
     ok: true,
@@ -6517,6 +6517,7 @@ app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
   const selector = String(req.query.selector || "").trim();
+  const ignore403 = String(req.query.ignore403 || "") === "1";
   const cookieChoice = String(req.query.cookieChoice || "").trim();
   const cookieFlow = String(req.query.cookieFlow || "") === "1";
 
@@ -6710,7 +6711,7 @@ app.get("/analyze", async (req, res) => {
 
     const result = await analyzePage(
       url,
-      (page) => analyzers[command](page, url, { selector }),
+      (page) => analyzers[command](page, url, { selector, ignore403 }),
       { cookieChoice, cookieFlow }
     );
 
