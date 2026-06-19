@@ -4945,8 +4945,16 @@ function extractLinksForBrokenCheck(html, baseUrl) {
 }
 
 async function checkCrawlHttpLink(link, options = {}) {
+  if (options.job?.cancelled) {
+    return null;
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
+
+  if (options.job) {
+    options.job.currentController = controller;
+  }
 
   try {
     let response = await fetch(link.href, {
@@ -4978,12 +4986,20 @@ async function checkCrawlHttpLink(link, options = {}) {
 
     return null;
   } catch (error) {
+    if (options.job?.cancelled) {
+      return null;
+    }
+
     return {
       ...link,
       reason: error.name === "AbortError" ? "Tidsavbrudd" : "Kunne ikke nå lenken",
     };
   } finally {
     clearTimeout(timeout);
+
+    if (options.job?.currentController === controller) {
+      options.job.currentController = null;
+    }
   }
 }
 
@@ -4995,6 +5011,10 @@ async function extractBrokenLinksFromHtml(html, pageUrl, options = {}) {
   pageUrlWithoutHash.hash = "";
 
   for (const link of links.slice(0, 80)) {
+    if (options.job?.cancelled) {
+      break;
+    }
+
     let parsed;
 
     try {
@@ -5239,7 +5259,9 @@ async function crawlDomain(startUrl, type, options = {}) {
         options.job.currentController = null;
       }
 
-      result.errors.push(`${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
+      if (!options.job?.cancelled) {
+        result.errors.push(`${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
+      }
     }
 
     finalizeDomainResult(result, started, queue.length);
@@ -5302,7 +5324,7 @@ function startDomainJob({ type, url, maxPages, maxSeconds, ignore403 = false }) 
   job.result.maxSeconds = safeMaxSeconds;
   domainJobs.set(id, job);
 
-  crawlDomain(url, type, {
+  job.completion = crawlDomain(url, type, {
     maxPages: safeMaxPages,
     maxSeconds: safeMaxSeconds,
     ignore403,
@@ -5326,7 +5348,7 @@ function startDomainJob({ type, url, maxPages, maxSeconds, ignore403 = false }) 
   return job;
 }
 
-function cancelDomainJob(jobId) {
+async function cancelDomainJob(jobId) {
   const job = domainJobs.get(jobId);
 
   if (!job) {
@@ -5334,15 +5356,16 @@ function cancelDomainJob(jobId) {
   }
 
   job.cancelled = true;
-  job.status = "cancelled";
-  job.finishedAt = Date.now();
   job.result.aborted = true;
 
   if (job.currentController) {
     job.currentController.abort();
   }
 
-  finalizeDomainResult(job.result, job.startedAt, job.result.pagesQueued || 0);
+  if (job.completion) {
+    await job.completion;
+  }
+
   return job;
 }
 
@@ -6636,7 +6659,7 @@ app.get("/analyze", async (req, res) => {
 
   if (command === "canceldomainjob") {
     const jobId = String(req.query.jobId || "").trim();
-    const job = cancelDomainJob(jobId);
+    const job = await cancelDomainJob(jobId);
 
     if (!job) {
       res.status(404).json({ ok: false, error: "Domenejobben finnes ikke lenger." });
