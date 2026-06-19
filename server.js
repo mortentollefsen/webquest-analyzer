@@ -4944,7 +4944,7 @@ function extractLinksForBrokenCheck(html, baseUrl) {
   return { links, anchorTargets };
 }
 
-async function checkCrawlHttpLink(link) {
+async function checkCrawlHttpLink(link, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8000);
 
@@ -4969,7 +4969,7 @@ async function checkCrawlHttpLink(link) {
       });
     }
 
-    if (response.status >= 400) {
+    if (response.status >= 400 && !(options.ignore403 && response.status === 403)) {
       return {
         ...link,
         reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
@@ -4987,7 +4987,7 @@ async function checkCrawlHttpLink(link) {
   }
 }
 
-async function extractBrokenLinksFromHtml(html, pageUrl) {
+async function extractBrokenLinksFromHtml(html, pageUrl, options = {}) {
   const { links, anchorTargets } = extractLinksForBrokenCheck(html, pageUrl);
   const pageUrlWithoutHash = new URL(pageUrl);
   const broken = [];
@@ -5041,7 +5041,7 @@ async function extractBrokenLinksFromHtml(html, pageUrl) {
       ...link,
       href: parsed.href,
       pageUrl,
-    });
+    }, options);
 
     if (brokenLink) {
       broken.push(brokenLink);
@@ -5205,7 +5205,7 @@ async function crawlDomain(startUrl, type, options = {}) {
       } catch {
       }
 
-      let items = await extractor.extract(pageResult.html, pageResult.finalUrl);
+      let items = await extractor.extract(pageResult.html, pageResult.finalUrl, options);
 
       if (type === "brokenlinks") {
         items = items.filter((item) => {
@@ -5280,7 +5280,7 @@ function normalizeDomainSeconds(value) {
   return Math.min(Math.max(5, parsed), maxDomainSeconds);
 }
 
-function startDomainJob({ type, url, maxPages, maxSeconds }) {
+function startDomainJob({ type, url, maxPages, maxSeconds, ignore403 = false }) {
   cleanupDomainJobs();
 
   const id = crypto.randomUUID();
@@ -5305,6 +5305,7 @@ function startDomainJob({ type, url, maxPages, maxSeconds }) {
   crawlDomain(url, type, {
     maxPages: safeMaxPages,
     maxSeconds: safeMaxSeconds,
+    ignore403,
     job,
   })
     .then((result) => {
@@ -6590,6 +6591,7 @@ app.get("/analyze", async (req, res) => {
       const type = String(req.query.type || "").trim().toLowerCase();
       const maxPages = normalizeDomainPageCount(req.query.maxPages);
       const maxSeconds = normalizeDomainSeconds(req.query.maxSeconds);
+      const ignore403 = String(req.query.ignore403 || "") === "1";
 
       if (!domainExtractors[type]) {
         res.status(400).json({ ok: false, error: "Ukjent domenejobb." });
@@ -6597,7 +6599,7 @@ app.get("/analyze", async (req, res) => {
       }
 
       const url = await validatePublicUrl(requestedUrl);
-      const job = startDomainJob({ type, url, maxPages, maxSeconds });
+      const job = startDomainJob({ type, url, maxPages, maxSeconds, ignore403 });
 
       res.json({
         ok: true,
