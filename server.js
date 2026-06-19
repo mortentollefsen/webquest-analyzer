@@ -26,7 +26,7 @@ const recycleBrowserAfterRssMb = Math.max(128, Number(process.env.WEBQUEST_RECYC
 const maxColorblindScreenshots = Math.max(1, Number(process.env.WEBQUEST_MAX_COLORBLIND_SCREENSHOTS || 6));
 const maxBrokenLinkWorkers = Math.max(1, Number(process.env.WEBQUEST_BROKEN_LINK_WORKERS || 4));
 const defaultDomainPages = Math.max(1, Number(process.env.WEBQUEST_DOMAIN_DEFAULT_PAGES || 150));
-const maxDomainPages = Math.max(defaultDomainPages, Number(process.env.WEBQUEST_DOMAIN_MAX_PAGES || 1000));
+const maxDomainPages = Math.max(defaultDomainPages, Number(process.env.WEBQUEST_DOMAIN_MAX_PAGES || 20000));
 const defaultDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_DOMAIN_DEFAULT_SECONDS || 300));
 const maxDomainSeconds = Math.max(defaultDomainSeconds, Number(process.env.WEBQUEST_DOMAIN_MAX_SECONDS || 28800));
 const domainJobTtlMs = Math.max(60000, Number(process.env.WEBQUEST_DOMAIN_JOB_TTL_MS || 600000));
@@ -5171,6 +5171,7 @@ async function crawlDomain(startUrl, type, options = {}) {
   const maxSeconds = Math.max(5, Number(options.maxSeconds || defaultDomainSeconds));
   const started = Date.now();
   const queue = [root.href];
+  let queueIndex = 0;
   const queued = new Set(queue);
   const visited = new Set();
   const seenBrokenLinks = new Set();
@@ -5182,7 +5183,7 @@ async function crawlDomain(startUrl, type, options = {}) {
     throw new Error("Ukjent domenejobb.");
   }
 
-  while (queue.length > 0 && visited.size < maxPages) {
+  while (queueIndex < queue.length && visited.size < maxPages) {
     if (options.job?.cancelled) {
       result.aborted = true;
       break;
@@ -5193,7 +5194,8 @@ async function crawlDomain(startUrl, type, options = {}) {
       break;
     }
 
-    const url = queue.shift();
+    const url = queue[queueIndex];
+    queueIndex += 1;
 
     if (!url || visited.has(url)) {
       continue;
@@ -5264,10 +5266,10 @@ async function crawlDomain(startUrl, type, options = {}) {
       }
     }
 
-    finalizeDomainResult(result, started, queue.length);
+    finalizeDomainResult(result, started, queue.length - queueIndex);
   }
 
-  return finalizeDomainResult(result, started, queue.length);
+  return finalizeDomainResult(result, started, queue.length - queueIndex);
 }
 
 function publicDomainJob(job) {
