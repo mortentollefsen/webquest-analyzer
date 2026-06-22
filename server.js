@@ -389,15 +389,67 @@ async function analyzePage(url, analyzer, options = {}) {
 }
 
 async function handleCookieChoice(page, options = {}) {
-  const choice = String(options.cookieChoice || "").trim();
+  const rawChoice = String(options.cookieChoice || "").trim();
+  let choices = [];
 
-  if (!options.cookieFlow && !choice) {
+  if (rawChoice) {
+    try {
+      const parsed = JSON.parse(rawChoice);
+      choices = Array.isArray(parsed) ? parsed.map((choice) => String(choice || "").trim()).filter(Boolean) : [rawChoice];
+    } catch {
+      choices = [rawChoice];
+    }
+  }
+
+  if (!options.cookieFlow && choices.length === 0) {
     return null;
   }
 
-  if (choice) {
-    if (choice !== "__skip__") {
-      await clickCookieControl(page, choice);
+  if (choices.length > 0) {
+    const appliedChoices = [];
+
+    for (const choice of choices) {
+      if (choice === "__skip__") {
+        return null;
+      }
+
+      const clickResult = await clickCookieControl(page, choice);
+
+      if (!clickResult?.clicked) {
+        const banner = await detectCookieBanner(page);
+
+        if (banner) {
+          return {
+            ok: true,
+            cookieChoiceNeeded: true,
+            cookieBanner: {
+              ...banner,
+              message: `Valget «${choice}» kunne ikke aktiveres. Velg på nytt.`,
+              appliedChoices,
+            },
+            pageInfo: await getPageInfo(page),
+          };
+        }
+
+        return null;
+      }
+
+      appliedChoices.push(clickResult.label || choice);
+    }
+
+    const nextBanner = await detectCookieBanner(page);
+
+    if (nextBanner) {
+      return {
+        ok: true,
+        cookieChoiceNeeded: true,
+        cookieBanner: {
+          ...nextBanner,
+          message: "Dialogen er fortsatt åpen. Velg neste kontroll.",
+          appliedChoices,
+        },
+        pageInfo: await getPageInfo(page),
+      };
     }
 
     return null;
@@ -418,14 +470,35 @@ async function handleCookieChoice(page, options = {}) {
 }
 
 async function detectCookieBanner(page) {
-  return page.evaluate(() => {
+  for (const frame of page.frames()) {
+    const result = await frame.evaluate(() => {
     const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot/i;
     const weakKeywordPattern = /personvern|privacy/i;
-    const choicePattern = /^(godta|aksepter|accept|allow|tillat|avvis|decline|reject|deny|ikke tillat|lagre|save|bekreft|confirm|samtykk|innstillinger|settings|tilpass|administrer|manage|kun nødvendige|nødvendige|necessary|utvalg|valg)/i;
-    const controlSelector = "button, a[href], input[type='button'], input[type='submit'], [role='button'], [tabindex]";
+    const choicePattern = /^(godta|godkjenn|aksepter|accept|allow|agree|tillat|avvis|avslå|decline|reject|deny|ikke godta|ikke tillat|bare nødvendige|kun nødvendige|nødvendige|necessary|essential|lagre|save|bekreft|confirm|fortsett|continue|samtykk|innstillinger|settings|tilpass|administrer|manage|detaljer|details|utvalg|valg)/i;
+    const policyPattern = /cookie|cookies|informasjonskaps|samtykke|consent/i;
+    const closePattern = /^(lukk|close|dismiss|×|x)$/i;
+    const explicitPattern = /cookie|consent|samtykke|gdpr|onetrust|cookiebot|usercentrics|trustarc|didomi|quantcast|coi-banner/i;
+    const controlSelector = "button, a[href], input[type='button'], input[type='submit'], input[type='reset'], [role='button'], summary";
 
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function queryAll(root, selector) {
+      const results = Array.from(root.querySelectorAll(selector));
+      const elements = Array.from(root.querySelectorAll("*"));
+
+      if (root instanceof Element && root.shadowRoot) {
+        results.push(...queryAll(root.shadowRoot, selector));
+      }
+
+      elements.forEach((element) => {
+        if (element.shadowRoot) {
+          results.push(...queryAll(element.shadowRoot, selector));
+        }
+      });
+
+      return results;
     }
 
     function visible(element) {
@@ -501,29 +574,45 @@ async function detectCookieBanner(page) {
       return false;
     }
 
-    function isLikelyCookieControl(control) {
+    function cookieControlKind(control) {
       const label = control.label.toLowerCase();
 
-      return choicePattern.test(label) ||
-        /cookie|cookies|informasjonskaps|samtykke|consent|privacy settings|personverninnstillinger/i.test(label);
+      if (choicePattern.test(label)) return "action";
+      if (closePattern.test(label)) return "close";
+      if (policyPattern.test(label)) return "policy";
+      return "";
     }
 
-    const candidates = Array.from(document.querySelectorAll(
+    function isLikelyCookieControl(control) {
+      return Boolean(cookieControlKind(control));
+    }
+
+    const candidates = queryAll(document,
       "[role='dialog'], [aria-modal='true'], dialog, aside, section, div, form"
-    ))
+    )
       .filter(visible)
       .map((element) => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
         const text = normalized(element.innerText || element.textContent);
-        const controls = Array.from(element.querySelectorAll(controlSelector))
+        const allControls = queryAll(element, controlSelector)
           .filter((control) => visible(control))
           .map((control) => ({
             label: controlName(control),
             selector: selectorFor(control),
             element: control.tagName.toLowerCase(),
           }))
-          .filter((control) => control.label && !/cookiebot av|usercentrics|åpner i et nytt vindu|opens in a new window/i.test(control.label))
+          .filter((control) =>
+            control.label &&
+            !/cookiebot av|powered by|åpner i et nytt vindu|opens in a new window/i.test(control.label) &&
+            !/^(cookie information|onetrust|cookiebot|usercentrics|didomi|trustarc)$/i.test(control.label)
+          );
+        const controls = allControls
+          .filter(isLikelyCookieControl)
+          .map((control) => ({
+            ...control,
+            kind: cookieControlKind(control),
+          }))
           .slice(0, 10);
         const fixed = ["fixed", "sticky"].includes(style.position);
         const modal = element.getAttribute("role") === "dialog" ||
@@ -540,27 +629,42 @@ async function detectCookieBanner(page) {
         const hasStrongKeyword = keywordPattern.test(text);
         const hasWeakKeyword = weakKeywordPattern.test(text);
         const likelyControls = controls.filter(isLikelyCookieControl);
+        const actionControls = controls.filter((control) => control.kind === "action");
         const pageChrome = isLikelyPageChrome(element, rect, style);
+        const explicit = explicitPattern.test([
+          element.id,
+          element.className,
+          element.getAttribute("aria-label"),
+          element.getAttribute("data-testid"),
+        ].map(normalized).join(" "));
+        const unrelatedControls = Math.max(0, allControls.length - controls.length);
         const score =
           (hasStrongKeyword ? 4 : 0) +
           (!hasStrongKeyword && hasWeakKeyword ? 1 : 0) +
-          (likelyControls.length ? 4 : 0) +
+          (actionControls.length ? 4 : 0) +
           (controls.length ? 2 : 0) +
           (fixed ? 2 : 0) +
           (modal ? 2 : 0) +
+          (explicit ? 5 : 0) +
           (largeOverlay ? 1 : 0) -
-          (pageChrome ? 6 : 0);
+          (pageChrome ? 6 : 0) -
+          Math.min(8, Math.floor(unrelatedControls / 3)) -
+          (text.length > 4000 ? 8 : text.length > 1800 ? 4 : 0);
 
-        return { element, text, controls, likelyControls, score, fixed, modal, largeOverlay, pageChrome, rect };
+        return { element, text, controls, likelyControls, actionControls, score, fixed, modal, explicit, largeOverlay, pageChrome, rect };
       })
       .filter((candidate) =>
         candidate.score >= 8 &&
         candidate.controls.length > 0 &&
-        candidate.likelyControls.length > 0 &&
-        !candidate.pageChrome &&
-        (candidate.modal || candidate.fixed || candidate.largeOverlay)
+        candidate.actionControls.length > 0 &&
+        (!candidate.pageChrome || candidate.modal || candidate.fixed || candidate.explicit) &&
+        (candidate.modal || candidate.fixed || candidate.explicit || candidate.largeOverlay)
       )
-      .sort((a, b) => b.score - a.score || (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height));
+      .sort((a, b) =>
+        b.score - a.score ||
+        (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height) ||
+        a.text.length - b.text.length
+      );
 
     const best = candidates[0];
 
@@ -569,26 +673,61 @@ async function detectCookieBanner(page) {
     }
 
     return {
-      textStart: best.text.slice(0, 220),
+      textStart: best.text.slice(0, 300),
       selector: selectorFor(best.element),
       controls: best.controls.map((control, index) => ({
         index: index + 1,
-        ...control,
+        label: control.label,
+        selector: control.selector,
+        element: control.element,
       })),
     };
-  }).catch(() => null);
+    }).catch(() => null);
+
+    if (result) {
+      return {
+        ...result,
+        frameUrl: frame === page.mainFrame() ? "" : frame.url(),
+      };
+    }
+  }
+
+  return null;
 }
 
 async function clickCookieControl(page, choice) {
-  await page.evaluate(async (rawChoice) => {
+  let clickResult = { clicked: false };
+
+  for (const frame of page.frames()) {
+    clickResult = await frame.evaluate(async (rawChoice) => {
     const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot/i;
     const weakKeywordPattern = /personvern|privacy/i;
-    const choicePattern = /^(godta|aksepter|accept|allow|tillat|avvis|decline|reject|deny|ikke tillat|lagre|save|bekreft|confirm|samtykk|innstillinger|settings|tilpass|administrer|manage|kun nødvendige|nødvendige|necessary|utvalg|valg)/i;
-    const controlSelector = "button, a[href], input[type='button'], input[type='submit'], [role='button'], [tabindex]";
+    const choicePattern = /^(godta|godkjenn|aksepter|accept|allow|agree|tillat|avvis|avslå|decline|reject|deny|ikke godta|ikke tillat|bare nødvendige|kun nødvendige|nødvendige|necessary|essential|lagre|save|bekreft|confirm|fortsett|continue|samtykk|innstillinger|settings|tilpass|administrer|manage|detaljer|details|utvalg|valg)/i;
+    const policyPattern = /cookie|cookies|informasjonskaps|samtykke|consent/i;
+    const closePattern = /^(lukk|close|dismiss|×|x)$/i;
+    const explicitPattern = /cookie|consent|samtykke|gdpr|onetrust|cookiebot|usercentrics|trustarc|didomi|quantcast|coi-banner/i;
+    const controlSelector = "button, a[href], input[type='button'], input[type='submit'], input[type='reset'], [role='button'], summary";
     const normalizedChoice = String(rawChoice || "").replace(/\s+/g, " ").trim().toLowerCase();
 
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function queryAll(root, selector) {
+      const results = Array.from(root.querySelectorAll(selector));
+      const elements = Array.from(root.querySelectorAll("*"));
+
+      if (root instanceof Element && root.shadowRoot) {
+        results.push(...queryAll(root.shadowRoot, selector));
+      }
+
+      elements.forEach((element) => {
+        if (element.shadowRoot) {
+          results.push(...queryAll(element.shadowRoot, selector));
+        }
+      });
+
+      return results;
     }
 
     function visible(element) {
@@ -642,18 +781,19 @@ async function clickCookieControl(page, choice) {
 
     function isLikelyCookieControl(label) {
       return choicePattern.test(label) ||
-        /cookie|cookies|informasjonskaps|samtykke|consent|privacy settings|personverninnstillinger/i.test(label);
+        policyPattern.test(label) ||
+        closePattern.test(label);
     }
 
-    const containers = Array.from(document.querySelectorAll(
+    const containers = queryAll(document,
       "[role='dialog'], [aria-modal='true'], dialog, aside, section, div, form"
-    ))
+    )
       .filter(visible)
       .filter((element) => {
         const rect = element.getBoundingClientRect();
         const style = window.getComputedStyle(element);
         const text = normalized(element.innerText || element.textContent);
-        const controls = Array.from(element.querySelectorAll(controlSelector))
+        const controls = queryAll(element, controlSelector)
           .filter(visible)
           .map(controlName)
           .filter(Boolean);
@@ -671,20 +811,45 @@ async function clickCookieControl(page, choice) {
           nearViewportEdge;
         const hasStrongKeyword = keywordPattern.test(text);
         const hasWeakKeyword = weakKeywordPattern.test(text);
+        const explicit = explicitPattern.test([
+          element.id,
+          element.className,
+          element.getAttribute("aria-label"),
+          element.getAttribute("data-testid"),
+        ].map(normalized).join(" "));
 
-        return !isLikelyPageChrome(element, rect, style) &&
-          (modal || fixed || largeOverlay) &&
+        return (!isLikelyPageChrome(element, rect, style) || modal || fixed || explicit) &&
+          (modal || fixed || explicit || largeOverlay) &&
           (hasStrongKeyword || hasWeakKeyword) &&
           controls.some((label) => isLikelyCookieControl(label.toLowerCase()));
+      })
+      .sort((a, b) => {
+        const aRect = a.getBoundingClientRect();
+        const bRect = b.getBoundingClientRect();
+        return (aRect.width * aRect.height) - (bRect.width * bRect.height);
       });
+    const seenControls = new Set();
     const controls = containers
-      .flatMap((container) => Array.from(container.querySelectorAll(controlSelector)))
+      .flatMap((container) => queryAll(container, controlSelector))
       .filter(visible)
       .map((element) => ({
         element,
         label: controlName(element),
       }))
-      .filter((control) => control.label && !/cookiebot av|usercentrics|åpner i et nytt vindu|opens in a new window/i.test(control.label))
+      .filter((control) => {
+        if (
+          !control.label ||
+          !isLikelyCookieControl(control.label.toLowerCase()) ||
+          /cookiebot av|powered by|åpner i et nytt vindu|opens in a new window/i.test(control.label) ||
+          /^(cookie information|onetrust|cookiebot|usercentrics|didomi|trustarc)$/i.test(control.label) ||
+          seenControls.has(control.element)
+        ) {
+          return false;
+        }
+
+        seenControls.add(control.element);
+        return true;
+      })
       .map((control, index) => ({
         ...control,
         index: index + 1,
@@ -695,16 +860,25 @@ async function clickCookieControl(page, choice) {
       controls.find((control) => control.label.toLowerCase().includes(normalizedChoice));
 
     if (!exact) {
-      return false;
+      return { clicked: false };
     }
 
     exact.element.click();
     await new Promise((resolve) => setTimeout(resolve, 800));
-    return true;
-  }, choice).catch(() => false);
+    return { clicked: true, label: exact.label };
+    }, choice).catch(() => ({ clicked: false }));
 
-  await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {});
-  await page.waitForTimeout(500);
+    if (clickResult.clicked) {
+      break;
+    }
+  }
+
+  if (clickResult.clicked) {
+    await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  return clickResult;
 }
 
 async function withPageInfo(page, analyzer) {
