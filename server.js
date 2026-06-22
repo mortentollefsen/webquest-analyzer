@@ -332,7 +332,7 @@ function setCorsHeaders(req, res) {
 }
 
 async function analyzePage(url, analyzer, options = {}) {
-  if (process.env.WEBQUEST_USE_PERSISTENT_BROWSER === "true") {
+  if (process.env.WEBQUEST_USE_PERSISTENT_BROWSER === "true" && !options.forceFreshContext) {
     const context = await getPersistentContext();
     let page;
 
@@ -2725,6 +2725,144 @@ async function getMetaInfo(page) {
       issues,
     };
   });
+}
+
+async function getCookiesInfo(page, pageUrl) {
+  const pageAddress = new URL(pageUrl);
+  const pageHost = pageAddress.hostname.toLowerCase();
+  const cookies = await page.context().cookies();
+  const issues = [];
+  const nowSeconds = Date.now() / 1000;
+
+  function normalizedDomain(domain) {
+    return String(domain || "").replace(/^\./, "").toLowerCase();
+  }
+
+  function relationFor(domain) {
+    const cookieDomain = normalizedDomain(domain);
+
+    if (pageHost === cookieDomain || pageHost.endsWith(`.${cookieDomain}`)) {
+      return "sidedomenet";
+    }
+
+    return "annet domene (mulig tredjepart)";
+  }
+
+  function valueForReport(cookie) {
+    const value = String(cookie.value || "");
+    const name = String(cookie.name || "");
+    const sensitiveName = /auth|session|token|jwt|login|csrf|xsrf|secret|bearer|oauth|(^|[_-])sid($|[_-])|(user|client|visitor|tracking|device)[_-]?id|(^|[_-])(id|uid)($|[_-])/i;
+    const trackingName = /^(_ga|_gid|_gat|_fbp|_fbc|_gcl|amplitude|mp_)/i;
+    const uuidLike = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const jwtLike = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?$/;
+    const longHex = /^[0-9a-f]{16,}$/i;
+    const longNumber = /^\d{12,}$/;
+    const compactIdentifier = /^[A-Za-z0-9_-]{20,}$/;
+    const uniqueRatio = value.length ? new Set(value).size / value.length : 0;
+
+    if (!value) {
+      return { valueHidden: false, displayValue: "", valueReason: "" };
+    }
+
+    if (cookie.httpOnly) {
+      return { valueHidden: true, displayValue: "", valueReason: "HttpOnly-cookie" };
+    }
+
+    if (sensitiveName.test(name)) {
+      return { valueHidden: true, displayValue: "", valueReason: "navnet tyder på sesjon, autentisering eller unik ID" };
+    }
+
+    if (trackingName.test(name)) {
+      return { valueHidden: true, displayValue: "", valueReason: "mulig sporings-ID" };
+    }
+
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) || /^https?:\/\//i.test(value)) {
+      return { valueHidden: true, displayValue: "", valueReason: "kan inneholde person- eller adresseopplysninger" };
+    }
+
+    if (/["']?(uid|user[_-]?id|client[_-]?id|visitor[_-]?id|device[_-]?id|token|session|auth)["']?\s*[:=]/i.test(value)) {
+      return { valueHidden: true, displayValue: "", valueReason: "strukturert verdi med mulig unik ID eller token" };
+    }
+
+    if (value.length > 80) {
+      return { valueHidden: true, displayValue: "", valueReason: "lang verdi" };
+    }
+
+    if (uuidLike.test(value) || jwtLike.test(value) || longHex.test(value) || longNumber.test(value)) {
+      return { valueHidden: true, displayValue: "", valueReason: "mulig unik ID eller token" };
+    }
+
+    if (compactIdentifier.test(value) && uniqueRatio > 0.55) {
+      return { valueHidden: true, displayValue: "", valueReason: "tilfeldig eller unik verdi" };
+    }
+
+    if (/[^\x20-\x7E\u00A0-\uFFFF]/.test(value)) {
+      return { valueHidden: true, displayValue: "", valueReason: "inneholder kontrolltegn" };
+    }
+
+    return { valueHidden: false, displayValue: value, valueReason: "" };
+  }
+
+  const items = cookies.map((cookie) => {
+    const session = !Number.isFinite(cookie.expires) || cookie.expires <= 0;
+    const remainingDays = session ? null : Math.max(0, Math.ceil((cookie.expires - nowSeconds) / 86400));
+    const estimatedSize = Buffer.byteLength(`${cookie.name}=${cookie.value}`, "utf8");
+    const relation = relationFor(cookie.domain);
+    const label = `${cookie.name} (${cookie.domain}${cookie.path || "/"})`;
+    const reportedValue = valueForReport(cookie);
+
+    if (pageAddress.protocol === "https:" && !cookie.secure) {
+      issues.push(`${label} mangler Secure og kan også sendes over en ukryptert HTTP-forbindelse.`);
+    }
+
+    if (String(cookie.sameSite || "").toLowerCase() === "none" && !cookie.secure) {
+      issues.push(`${label} har SameSite=None uten Secure.`);
+    }
+
+    if (/auth|session|token|jwt|login|(^|[_-])sid($|[_-])/i.test(cookie.name) && !cookie.httpOnly) {
+      issues.push(`${label} kan være knyttet til innlogging eller sesjon, men mangler HttpOnly.`);
+    }
+
+    if (estimatedSize > 4096) {
+      issues.push(`${label} er omtrent ${estimatedSize} byte og er større enn den vanlige grensen på 4096 byte.`);
+    }
+
+    if (remainingDays !== null && remainingDays > 400) {
+      issues.push(`${label} har mer enn 400 dager igjen av levetiden.`);
+    }
+
+    return {
+      name: cookie.name,
+      domain: cookie.domain,
+      path: cookie.path || "/",
+      relation,
+      session,
+      expiresAt: session ? "" : new Date(cookie.expires * 1000).toISOString(),
+      remainingDays,
+      secure: Boolean(cookie.secure),
+      httpOnly: Boolean(cookie.httpOnly),
+      sameSite: cookie.sameSite || "ikke oppgitt",
+      partitioned: Boolean(cookie.partitionKey),
+      valueLength: String(cookie.value || "").length,
+      ...reportedValue,
+      estimatedSize,
+    };
+  }).sort((a, b) =>
+    a.relation.localeCompare(b.relation, "nb") ||
+    a.domain.localeCompare(b.domain, "nb") ||
+    a.name.localeCompare(b.name, "nb")
+  );
+
+  return {
+    items,
+    issues: Array.from(new Set(issues)),
+    pageDomainCount: items.filter((cookie) => cookie.relation === "sidedomenet").length,
+    otherDomainCount: items.filter((cookie) => cookie.relation !== "sidedomenet").length,
+    sessionCount: items.filter((cookie) => cookie.session).length,
+    persistentCount: items.filter((cookie) => !cookie.session).length,
+    secureCount: items.filter((cookie) => cookie.secure).length,
+    httpOnlyCount: items.filter((cookie) => cookie.httpOnly).length,
+  };
 }
 
 async function getReadability(page) {
@@ -6373,6 +6511,12 @@ const analyzers = {
     url,
     meta: await getMetaInfo(page),
   }),
+  cookies: async (page, url) => ({
+    ok: true,
+    engine: "playwright",
+    url,
+    cookies: await getCookiesInfo(page, url),
+  }),
   readability: async (page, url) => ({
     ok: true,
     engine: "playwright",
@@ -6739,7 +6883,7 @@ app.get("/analyze", async (req, res) => {
     const result = await analyzePage(
       url,
       (page) => analyzers[command](page, url, { selector, ignore403 }),
-      { cookieChoice, cookieFlow }
+      { cookieChoice, cookieFlow, forceFreshContext: command === "cookies" }
     );
 
     res.json(result);
