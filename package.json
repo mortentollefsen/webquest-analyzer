@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "axe-core": "^4.10.3",
+    "css-tree": "^3.2.1",
     "express": "^4.19.2",
     "html-validate": "^11.5.3",
     "playwright": "1.60.0"

@@ -5,6 +5,7 @@ import net from "node:net";
 import crypto from "node:crypto";
 import axe from "axe-core";
 import { HtmlValidate } from "html-validate";
+import * as csstree from "css-tree";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -4051,6 +4052,545 @@ async function getCssOverview(page) {
   });
 }
 
+function splitCssSelectorList(selectorText) {
+  const selectors = [];
+  let current = "";
+  let quote = "";
+  let parentheses = 0;
+  let brackets = 0;
+
+  for (const character of String(selectorText || "")) {
+    if (quote) {
+      current += character;
+
+      if (character === quote) {
+        quote = "";
+      }
+
+      continue;
+    }
+
+    if (character === "'" || character === '"') {
+      quote = character;
+      current += character;
+      continue;
+    }
+
+    if (character === "(") parentheses += 1;
+    if (character === ")") parentheses = Math.max(0, parentheses - 1);
+    if (character === "[") brackets += 1;
+    if (character === "]") brackets = Math.max(0, brackets - 1);
+
+    if (character === "," && parentheses === 0 && brackets === 0) {
+      selectors.push(current.trim());
+      current = "";
+      continue;
+    }
+
+    current += character;
+  }
+
+  if (current.trim()) {
+    selectors.push(current.trim());
+  }
+
+  return selectors;
+}
+
+function cssSelectorMatchType(selectorText, searchSelector) {
+  const normalizedSearch = String(searchSelector || "").replace(/\s+/g, " ").trim();
+  const selectorParts = splitCssSelectorList(selectorText)
+    .map((selector) => selector.replace(/\s+/g, " ").trim());
+
+  if (selectorParts.includes(normalizedSearch)) {
+    return "exact";
+  }
+
+  const escaped = normalizedSearch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let pattern;
+
+  if (/^[.#][-_a-zA-Z0-9]+$/.test(normalizedSearch)) {
+    pattern = new RegExp(`${escaped}(?![-_a-zA-Z0-9])`);
+  } else if (/^[-_a-zA-Z][-_a-zA-Z0-9]*$/.test(normalizedSearch)) {
+    pattern = new RegExp(`(^|[\\s>+~,(])${escaped}(?=($|[\\s.#:[>+~),]))`, "i");
+  }
+
+  if (pattern ? pattern.test(selectorText) : selectorText.includes(normalizedSearch)) {
+    return "related";
+  }
+
+  return "";
+}
+
+async function fetchCssForRuleSearch(startUrl, referer = "") {
+  let currentUrl = startUrl;
+
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount += 1) {
+    const validatedUrl = await validatePublicUrl(currentUrl);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+
+    try {
+      const response = await fetch(validatedUrl, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+          "Accept": "text/css,*/*;q=0.1",
+          ...(referer ? { Referer: referer } : {}),
+        },
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+
+        if (!location) {
+          throw new Error("CSS-filen omdirigerte uten en ny adresse.");
+        }
+
+        currentUrl = new URL(location, validatedUrl).href;
+        continue;
+      }
+
+      if (!response.ok) {
+        throw new Error(`CSS-filen svarte med HTTP ${response.status}.`);
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+
+      if (/text\/html|application\/xhtml\+xml/i.test(contentType)) {
+        throw new Error("Adressen returnerte HTML i stedet for CSS.");
+      }
+
+      const declaredLength = Number(response.headers.get("content-length") || 0);
+
+      if (declaredLength > 2_000_000) {
+        throw new Error("CSS-filen er større enn 2 MB.");
+      }
+
+      const text = await response.text();
+
+      if (Buffer.byteLength(text, "utf8") > 2_000_000) {
+        throw new Error("CSS-filen er større enn 2 MB.");
+      }
+
+      return { url: response.url || validatedUrl, text };
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  throw new Error("CSS-filen har for mange omdirigeringer.");
+}
+
+function parseCssRulesFromText(cssText, sourceUrl, searchSelector) {
+  const rules = [];
+  const imports = [];
+  let truncated = false;
+  let ast;
+
+  try {
+    ast = csstree.parse(cssText, {
+      positions: true,
+      filename: sourceUrl,
+      parseValue: false,
+    });
+  } catch (error) {
+    return {
+      rules,
+      imports,
+      error: `CSS-parseren kunne ikke lese filen: ${String(error.message || error)}`,
+    };
+  }
+
+  function walkNodes(children, conditions = []) {
+    if (!children) {
+      return;
+    }
+
+    children.forEach((node) => {
+      if (node.type === "Atrule" && String(node.name).toLowerCase() === "import" && node.prelude) {
+        let importValue = "";
+
+        csstree.walk(node.prelude, (part) => {
+          if (!importValue && (part.type === "Url" || part.type === "String")) {
+            importValue = part.value || "";
+          }
+        });
+
+        if (importValue) {
+          try {
+            imports.push(new URL(importValue, sourceUrl).href);
+          } catch {
+          }
+        }
+      }
+
+      if (node.type === "Atrule" && node.block?.children) {
+        const prelude = node.prelude ? csstree.generate(node.prelude) : "";
+        const condition = `@${node.name}${prelude ? ` ${prelude}` : ""}`;
+        walkNodes(node.block.children, [...conditions, condition]);
+        return;
+      }
+
+      if (node.type !== "Rule" || !node.prelude) {
+        return;
+      }
+
+      const selectorText = csstree.generate(node.prelude);
+      const matchType = cssSelectorMatchType(selectorText, searchSelector);
+
+      if (matchType) {
+        const declarations = [];
+
+        if (node.block?.children) {
+          node.block.children.forEach((child) => {
+            if (child.type === "Declaration") {
+              declarations.push({
+                property: child.property || "",
+                value: child.value ? csstree.generate(child.value) : "",
+                priority: child.important ? "important" : "",
+              });
+            }
+          });
+        }
+
+        if (rules.length >= 250) {
+          truncated = true;
+          return;
+        }
+
+        rules.push({
+          selector: selectorText,
+          matchType,
+          cssText: csstree.generate(node),
+          declarations,
+          source: sourceUrl,
+          sourceType: "ekstern CSS lest av serveren",
+          line: node.loc?.start?.line || 0,
+          column: node.loc?.start?.column || 0,
+          conditions,
+          active: null,
+          elementCount: null,
+          order: 0,
+        });
+      }
+
+      if (node.block?.children) {
+        const nestedRules = [];
+
+        node.block.children.forEach((child) => {
+          if (child.type === "Rule" || child.type === "Atrule") {
+            nestedRules.push(child);
+          }
+        });
+
+        if (nestedRules.length) {
+          walkNodes(nestedRules, conditions);
+        }
+      }
+    });
+  }
+
+  walkNodes(ast.children);
+
+  return { rules, imports: Array.from(new Set(imports)), error: "", truncated };
+}
+
+async function getCssRules(page, selector) {
+  const browserResult = await page.evaluate((searchSelector) => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function splitSelectorList(selectorText) {
+      const selectors = [];
+      let current = "";
+      let quote = "";
+      let parentheses = 0;
+      let brackets = 0;
+
+      for (const character of String(selectorText || "")) {
+        if (quote) {
+          current += character;
+          if (character === quote) quote = "";
+          continue;
+        }
+
+        if (character === "'" || character === '"') {
+          quote = character;
+          current += character;
+          continue;
+        }
+
+        if (character === "(") parentheses += 1;
+        if (character === ")") parentheses = Math.max(0, parentheses - 1);
+        if (character === "[") brackets += 1;
+        if (character === "]") brackets = Math.max(0, brackets - 1);
+
+        if (character === "," && parentheses === 0 && brackets === 0) {
+          selectors.push(current.trim());
+          current = "";
+          continue;
+        }
+
+        current += character;
+      }
+
+      if (current.trim()) selectors.push(current.trim());
+      return selectors;
+    }
+
+    function matchTypeFor(selectorText) {
+      const normalizedSearch = normalized(searchSelector);
+      const selectorParts = splitSelectorList(selectorText).map(normalized);
+
+      if (selectorParts.includes(normalizedSearch)) {
+        return "exact";
+      }
+
+      const escaped = normalizedSearch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      let pattern;
+
+      if (/^[.#][-_a-zA-Z0-9]+$/.test(normalizedSearch)) {
+        pattern = new RegExp(`${escaped}(?![-_a-zA-Z0-9])`);
+      } else if (/^[-_a-zA-Z][-_a-zA-Z0-9]*$/.test(normalizedSearch)) {
+        pattern = new RegExp(`(^|[\\s>+~,(])${escaped}(?=($|[\\s.#:[>+~),]))`, "i");
+      }
+
+      return (pattern ? pattern.test(selectorText) : selectorText.includes(normalizedSearch))
+        ? "related"
+        : "";
+    }
+
+    function queryCount(root, selectorText) {
+      try {
+        return root.querySelectorAll(selectorText).length;
+      } catch {
+        return null;
+      }
+    }
+
+    function conditionFor(rule) {
+      const name = rule.constructor?.name || "";
+      const text = rule.conditionText || rule.name || "";
+      let active = null;
+
+      if (name === "CSSMediaRule") {
+        active = window.matchMedia(rule.conditionText).matches;
+      } else if (name === "CSSSupportsRule") {
+        try {
+          active = CSS.supports(rule.conditionText);
+        } catch {
+          active = null;
+        }
+      } else if (/CSSLayer|CSSScope|CSSContainer/i.test(name)) {
+        active = true;
+      }
+
+      return {
+        type: name.replace(/^CSS|Rule$/g, "") || "gruppe",
+        text,
+        active,
+      };
+    }
+
+    function sourceFor(sheet, index, scopeName) {
+      if (sheet.href) return sheet.href;
+      if (sheet.ownerNode?.tagName?.toLowerCase() === "style") {
+        const id = sheet.ownerNode.id ? `#${sheet.ownerNode.id}` : "";
+        return `style-element ${index + 1}${id}${scopeName ? ` i ${scopeName}` : ""}`;
+      }
+      return `adopted stylesheet ${index + 1}${scopeName ? ` i ${scopeName}` : ""}`;
+    }
+
+    const result = {
+      selector: normalized(searchSelector),
+      elementCount: 0,
+      selectorValidForElements: true,
+      rules: [],
+      readableStyleSheets: 0,
+      blockedStyleSheets: [],
+      styleSheetCount: 0,
+      truncated: false,
+    };
+
+    try {
+      result.elementCount = document.querySelectorAll(searchSelector).length;
+    } catch {
+      result.selectorValidForElements = false;
+    }
+
+    const sheetEntries = [];
+    const seenSheets = new WeakSet();
+    let ruleOrder = 0;
+
+    function addSheet(sheet, root, scopeName) {
+      if (!sheet || seenSheets.has(sheet)) return;
+      seenSheets.add(sheet);
+      sheetEntries.push({ sheet, root, scopeName });
+    }
+
+    Array.from(document.styleSheets).forEach((sheet) => addSheet(sheet, document, ""));
+    Array.from(document.adoptedStyleSheets || []).forEach((sheet) => addSheet(sheet, document, "document"));
+
+    Array.from(document.querySelectorAll("*")).forEach((host) => {
+      if (!host.shadowRoot) return;
+      const scopeName = host.id ? `shadow DOM #${host.id}` : `shadow DOM ${host.tagName.toLowerCase()}`;
+      Array.from(host.shadowRoot.querySelectorAll("style, link[rel~='stylesheet']")).forEach((node) => {
+        if (node.sheet) addSheet(node.sheet, host.shadowRoot, scopeName);
+      });
+      Array.from(host.shadowRoot.adoptedStyleSheets || []).forEach((sheet) => addSheet(sheet, host.shadowRoot, scopeName));
+    });
+
+    function walkRules(rules, entry, conditions = []) {
+      Array.from(rules || []).forEach((rule) => {
+        ruleOrder += 1;
+
+        if (typeof rule.selectorText === "string") {
+          const matchType = matchTypeFor(rule.selectorText);
+
+          if (matchType && result.rules.length < 200) {
+            const declarations = rule.style
+              ? Array.from(rule.style).map((property) => ({
+                  property,
+                  value: rule.style.getPropertyValue(property).trim(),
+                  priority: rule.style.getPropertyPriority(property),
+                }))
+              : [];
+
+            result.rules.push({
+              selector: rule.selectorText,
+              matchType,
+              cssText: rule.cssText || "",
+              declarations,
+              source: sourceFor(entry.sheet, entry.index, entry.scopeName),
+              sourceType: entry.sheet.href ? "ekstern CSS lest av nettleseren" : "CSS i dokumentet",
+              line: 0,
+              column: 0,
+              conditions,
+              active: !entry.sheet.disabled && conditions.every((condition) => condition.active !== false),
+              elementCount: queryCount(entry.root, rule.selectorText),
+              order: ruleOrder,
+            });
+          } else if (matchType) {
+            result.truncated = true;
+          }
+        }
+
+        if (rule.styleSheet) {
+          try {
+            walkRules(rule.styleSheet.cssRules, { ...entry, sheet: rule.styleSheet }, [
+              ...conditions,
+              { type: "import", text: rule.media?.mediaText || "", active: true },
+            ]);
+          } catch {
+          }
+        } else if (rule.cssRules) {
+          const condition = conditionFor(rule);
+          walkRules(rule.cssRules, entry, [...conditions, condition]);
+        }
+      });
+    }
+
+    sheetEntries.forEach((entry, index) => {
+      entry.index = index;
+      result.styleSheetCount += 1;
+
+      try {
+        const cssRules = entry.sheet.cssRules;
+        result.readableStyleSheets += 1;
+        const sheetConditions = entry.sheet.media?.mediaText
+          ? [{
+              type: "media",
+              text: entry.sheet.media.mediaText,
+              active: window.matchMedia(entry.sheet.media.mediaText).matches,
+            }]
+          : [];
+        walkRules(cssRules, entry, sheetConditions);
+      } catch {
+        result.blockedStyleSheets.push({
+          href: entry.sheet.href || "",
+          source: sourceFor(entry.sheet, index, entry.scopeName),
+        });
+      }
+    });
+
+    return result;
+  }, selector);
+
+  const fallbackRules = [];
+  const fallbackErrors = [];
+  let fallbackTruncated = false;
+  const fetched = new Set();
+  const successfullyFetched = new Set();
+  const queue = browserResult.blockedStyleSheets
+    .map((sheet) => sheet.href)
+    .filter(Boolean)
+    .slice(0, 20);
+  let totalFetchedBytes = 0;
+
+  while (queue.length && fetched.size < 30 && totalFetchedBytes < 8_000_000) {
+    const href = queue.shift();
+
+    if (!href || fetched.has(href)) {
+      continue;
+    }
+
+    fetched.add(href);
+
+    try {
+      const fetchedCss = await fetchCssForRuleSearch(href, page.url());
+      successfullyFetched.add(href);
+      totalFetchedBytes += Buffer.byteLength(fetchedCss.text, "utf8");
+      const parsed = parseCssRulesFromText(fetchedCss.text, fetchedCss.url, selector);
+      fallbackTruncated = fallbackTruncated || parsed.truncated;
+
+      if (parsed.error) {
+        fallbackErrors.push(`${fetchedCss.url}: ${parsed.error}`);
+      }
+
+      parsed.rules.forEach((rule) => {
+        if (fallbackRules.length < 200) {
+          fallbackRules.push(rule);
+        }
+      });
+
+      parsed.imports.forEach((importUrl) => {
+        if (!fetched.has(importUrl) && queue.length < 30) {
+          queue.push(importUrl);
+        }
+      });
+    } catch (error) {
+      fallbackErrors.push(`${href}: ${friendlyErrorMessage(error, "CSS-filen kunne ikke hentes.")}`);
+    }
+  }
+
+  const combinedRules = [...browserResult.rules, ...fallbackRules]
+    .map((rule, index) => ({ ...rule, order: rule.order || browserResult.rules.length + index + 1 }))
+    .sort((a, b) => a.order - b.order);
+  const rules = combinedRules.slice(0, 200);
+  const resolvedBlocked = browserResult.blockedStyleSheets
+    .filter((sheet) => successfullyFetched.has(sheet.href))
+    .length;
+
+  return {
+    selector: browserResult.selector,
+    elementCount: browserResult.elementCount,
+    selectorValidForElements: browserResult.selectorValidForElements,
+    rules,
+    exactCount: rules.filter((rule) => rule.matchType === "exact").length,
+    relatedCount: rules.filter((rule) => rule.matchType === "related").length,
+    styleSheetCount: browserResult.styleSheetCount,
+    readableStyleSheets: browserResult.readableStyleSheets,
+    blockedStyleSheets: browserResult.blockedStyleSheets.length,
+    serverReadStyleSheets: successfullyFetched.size,
+    unresolvedBlocked: Math.max(0, browserResult.blockedStyleSheets.length - resolvedBlocked),
+    truncated: browserResult.truncated || fallbackTruncated || combinedRules.length > rules.length,
+    errors: fallbackErrors.slice(0, 20),
+  };
+}
+
 async function getCssHidden(page) {
   return page.evaluate(() => {
     function normalized(text) {
@@ -6589,6 +7129,12 @@ const analyzers = {
     url,
     cssElement: await getCssElement(page, options.selector || "body"),
   }),
+  cssregel: async (page, url, options = {}) => ({
+    ok: true,
+    engine: "playwright+css-tree",
+    url,
+    cssRule: await getCssRules(page, options.selector || "body"),
+  }),
   cssfarger: async (page, url) => ({
     ok: true,
     engine: "playwright",
@@ -7062,6 +7608,7 @@ app.get("/analyze", async (req, res) => {
 
     res.json(result);
   } catch (error) {
+    console.error(`Analysefeil for ${command || "ukjent kommando"}: ${String(error?.stack || error)}`);
     res.status(500).json({
       ok: false,
       error: friendlyErrorMessage(error, "Jeg fikk ikke analysert siden."),
