@@ -5955,6 +5955,10 @@ async function fetchHtmlForCrawl(url, options = {}) {
 }
 
 const domainExtractors = {
+  pagecount: {
+    label: "Antall sider",
+    extract: () => [],
+  },
   emails: {
     label: "E-postadresser",
     extract: extractEmailsFromHtml,
@@ -5993,6 +5997,7 @@ function emptyDomainResult(type, startUrl, maxPages = defaultDomainPages) {
     label: domainExtractors[type]?.label || type,
     startUrl,
     pagesChecked: 0,
+    pagesReached: 0,
     pagesQueued: 0,
     maxPages,
     maxSeconds: defaultDomainSeconds,
@@ -6002,14 +6007,25 @@ function emptyDomainResult(type, startUrl, maxPages = defaultDomainPages) {
     truncated: false,
     totalFindings: 0,
     pages: [],
+    errorCount: 0,
     errors: [],
   };
+}
+
+function addDomainError(result, message) {
+  result.errorCount += 1;
+
+  if (result.type !== "pagecount" || result.errors.length < 20) {
+    result.errors.push(message);
+  }
 }
 
 function finalizeDomainResult(result, started, queueLength = 0) {
   result.pagesQueued = queueLength;
   result.secondsUsed = Math.round((Date.now() - started) / 1000);
-  result.totalFindings = result.pages.reduce((sum, page) => sum + (page.count || 0), 0);
+  result.totalFindings = result.type === "pagecount"
+    ? result.pagesReached
+    : result.pages.reduce((sum, page) => sum + (page.count || 0), 0);
   result.truncated = queueLength > 0 || result.stoppedByTime || result.pagesChecked >= result.maxPages;
   return result;
 }
@@ -6026,6 +6042,7 @@ async function crawlDomain(startUrl, type, options = {}) {
   let queueIndex = 0;
   const queued = new Set(queue);
   const visited = new Set();
+  const reachedPages = new Set();
   const seenBrokenLinks = new Set();
   const result = options.job?.result || emptyDomainResult(type, root.href, maxPages);
 
@@ -6070,7 +6087,7 @@ async function crawlDomain(startUrl, type, options = {}) {
       }
 
       if (!pageResult.ok) {
-        result.errors.push(`${url}: HTTP ${pageResult.status || "ukjent"}`);
+        addDomainError(result, `${url}: HTTP ${pageResult.status || "ukjent"}`);
         continue;
       }
 
@@ -6078,6 +6095,16 @@ async function crawlDomain(startUrl, type, options = {}) {
         hostVariants(new URL(pageResult.finalUrl).hostname).forEach((host) => allowedHosts.add(host));
       } catch {
       }
+
+      try {
+        const reachedUrl = new URL(pageResult.finalUrl);
+        reachedUrl.hash = "";
+        reachedPages.add(reachedUrl.href);
+      } catch {
+        reachedPages.add(pageResult.finalUrl);
+      }
+
+      result.pagesReached = reachedPages.size;
 
       let items = await extractor.extract(pageResult.html, pageResult.finalUrl, options);
 
@@ -6114,7 +6141,7 @@ async function crawlDomain(startUrl, type, options = {}) {
       }
 
       if (!options.job?.cancelled) {
-        result.errors.push(`${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
+        addDomainError(result, `${url}: ${friendlyErrorMessage(error, "Kunne ikke hente siden.")}`);
       }
     }
 
