@@ -32,6 +32,7 @@ const defaultDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_DOMAIN_DEFA
 const maxDomainSeconds = Math.max(defaultDomainSeconds, Number(process.env.WEBQUEST_DOMAIN_MAX_SECONDS || 28800));
 const domainJobTtlMs = Math.max(60000, Number(process.env.WEBQUEST_DOMAIN_JOB_TTL_MS || 600000));
 const domainJobs = new Map();
+const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
@@ -42,9 +43,20 @@ function browserContextOptions(extra = {}) {
     bypassCSP: true,
     locale: "nb-NO",
     serviceWorkers: "block",
+    viewport: { ...defaultViewport },
     userAgent:
       "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
     ...extra,
+  };
+}
+
+function normalizeViewport(widthValue, heightValue) {
+  const width = Number.parseInt(String(widthValue || ""), 10);
+  const height = Number.parseInt(String(heightValue || ""), 10);
+
+  return {
+    width: Number.isFinite(width) ? Math.min(7680, Math.max(240, width)) : defaultViewport.width,
+    height: Number.isFinite(height) ? Math.min(4320, Math.max(200, height)) : defaultViewport.height,
   };
 }
 
@@ -333,12 +345,15 @@ function setCorsHeaders(req, res) {
 }
 
 async function analyzePage(url, analyzer, options = {}) {
+  const viewport = options.viewport || defaultViewport;
+
   if (process.env.WEBQUEST_USE_PERSISTENT_BROWSER === "true" && !options.forceFreshContext) {
     const context = await getPersistentContext();
     let page;
 
     try {
       page = await context.newPage();
+      await page.setViewportSize(viewport);
       await gotoForAnalysis(page, url, 90000);
       const cookieResult = await handleCookieChoice(page, options);
 
@@ -352,6 +367,7 @@ async function analyzePage(url, analyzer, options = {}) {
         await resetPersistentContext();
         const retryContext = await getPersistentContext();
         page = await retryContext.newPage();
+        await page.setViewportSize(viewport);
         await gotoForAnalysis(page, url, 90000);
         const cookieResult = await handleCookieChoice(page, options);
 
@@ -371,7 +387,7 @@ async function analyzePage(url, analyzer, options = {}) {
   }
 
   const browser = await getBrowser();
-  const context = await browser.newContext(browserContextOptions());
+  const context = await browser.newContext(browserContextOptions({ viewport }));
   const page = await context.newPage();
   let session;
 
@@ -904,6 +920,8 @@ async function getPageInfo(page) {
       finalUrl: location.href,
       bodyTextStart: text,
       headingCount: document.querySelectorAll("h1, h2, h3, h4, h5, h6").length,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
     };
   }).catch(() => ({
     title: "",
@@ -6527,7 +6545,8 @@ function timestampPart(date = new Date()) {
 
 async function createSaveArchive(url, options = {}) {
   const browser = await getBrowser();
-  const context = await browser.newContext(browserContextOptions());
+  const viewport = options.viewport || defaultViewport;
+  const context = await browser.newContext(browserContextOptions({ viewport }));
   const page = await context.newPage();
 
   try {
@@ -7437,6 +7456,7 @@ app.get("/analyze", async (req, res) => {
   const ignore403 = String(req.query.ignore403 || "") === "1";
   const cookieChoice = String(req.query.cookieChoice || "").trim();
   const cookieFlow = String(req.query.cookieFlow || "") === "1";
+  const viewport = normalizeViewport(req.query.viewportWidth, req.query.viewportHeight);
 
   if (command === "describe") {
     if (!requestedUrl) {
@@ -7578,7 +7598,7 @@ app.get("/analyze", async (req, res) => {
 
     try {
       const url = await validatePublicUrl(requestedUrl);
-      const archive = await createSaveArchive(url, { cookieChoice, cookieFlow });
+      const archive = await createSaveArchive(url, { cookieChoice, cookieFlow, viewport });
 
       if (archive.cookieChoiceNeeded) {
         res.json(archive);
@@ -7630,7 +7650,7 @@ app.get("/analyze", async (req, res) => {
     const result = await analyzePage(
       url,
       (page) => analyzers[command](page, url, { selector, ignore403 }),
-      { cookieChoice, cookieFlow, forceFreshContext: command === "cookies" }
+      { cookieChoice, cookieFlow, viewport, forceFreshContext: command === "cookies" }
     );
 
     res.json(result);
