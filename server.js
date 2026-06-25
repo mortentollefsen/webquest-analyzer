@@ -34,6 +34,11 @@ const domainJobTtlMs = Math.max(60000, Number(process.env.WEBQUEST_DOMAIN_JOB_TT
 const domainJobs = new Map();
 const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
+
+function shouldIgnoreHttpStatus(status, options = {}) {
+  return (options.ignore401 && status === 401) || (options.ignore403 && status === 403);
+}
+
 const htmlValidator = new HtmlValidate({
   extends: ["html-validate:recommended"],
 });
@@ -2567,7 +2572,7 @@ async function getBrokenLinks(page, pageUrl, options = {}) {
         statusText: response.statusText || "",
       });
 
-      if (response.status >= 400 && !(options.ignore403 && response.status === 403)) {
+      if (response.status >= 400 && !shouldIgnoreHttpStatus(response.status, options)) {
         broken.push({
           ...link,
           reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
@@ -5847,7 +5852,7 @@ async function checkCrawlHttpLink(link, options = {}) {
       });
     }
 
-    if (response.status >= 400 && !(options.ignore403 && response.status === 403)) {
+    if (response.status >= 400 && !shouldIgnoreHttpStatus(response.status, options)) {
       return {
         ...link,
         reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
@@ -6201,7 +6206,7 @@ function normalizeDomainSeconds(value) {
   return Math.min(Math.max(5, parsed), maxDomainSeconds);
 }
 
-function startDomainJob({ type, url, maxPages, maxSeconds, ignore403 = false }) {
+function startDomainJob({ type, url, maxPages, maxSeconds, ignore401 = false, ignore403 = false }) {
   cleanupDomainJobs();
 
   const id = crypto.randomUUID();
@@ -6226,6 +6231,7 @@ function startDomainJob({ type, url, maxPages, maxSeconds, ignore403 = false }) 
   job.completion = crawlDomain(url, type, {
     maxPages: safeMaxPages,
     maxSeconds: safeMaxSeconds,
+    ignore401,
     ignore403,
     job,
   })
@@ -7453,6 +7459,7 @@ app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
   const selector = String(req.query.selector || "").trim();
+  const ignore401 = String(req.query.ignore401 || "") === "1";
   const ignore403 = String(req.query.ignore403 || "") === "1";
   const cookieChoice = String(req.query.cookieChoice || "").trim();
   const cookieFlow = String(req.query.cookieFlow || "") === "1";
@@ -7527,6 +7534,7 @@ app.get("/analyze", async (req, res) => {
       const type = String(req.query.type || "").trim().toLowerCase();
       const maxPages = normalizeDomainPageCount(req.query.maxPages);
       const maxSeconds = normalizeDomainSeconds(req.query.maxSeconds);
+      const ignore401 = String(req.query.ignore401 || "") === "1";
       const ignore403 = String(req.query.ignore403 || "") === "1";
 
       if (!domainExtractors[type]) {
@@ -7535,7 +7543,7 @@ app.get("/analyze", async (req, res) => {
       }
 
       const url = await validatePublicUrl(requestedUrl);
-      const job = startDomainJob({ type, url, maxPages, maxSeconds, ignore403 });
+      const job = startDomainJob({ type, url, maxPages, maxSeconds, ignore401, ignore403 });
 
       res.json({
         ok: true,
@@ -7649,7 +7657,7 @@ app.get("/analyze", async (req, res) => {
 
     const result = await analyzePage(
       url,
-      (page) => analyzers[command](page, url, { selector, ignore403 }),
+      (page) => analyzers[command](page, url, { selector, ignore401, ignore403 }),
       { cookieChoice, cookieFlow, viewport, forceFreshContext: command === "cookies" }
     );
 
