@@ -32,6 +32,9 @@ const defaultDomainSeconds = Math.max(5, Number(process.env.WEBQUEST_DOMAIN_DEFA
 const maxDomainSeconds = Math.max(defaultDomainSeconds, Number(process.env.WEBQUEST_DOMAIN_MAX_SECONDS || 28800));
 const domainJobTtlMs = Math.max(60000, Number(process.env.WEBQUEST_DOMAIN_JOB_TTL_MS || 600000));
 const domainJobs = new Map();
+const interactiveSessionTtlMs = Math.max(60000, Number(process.env.WEBQUEST_INTERACTIVE_SESSION_TTL_MS || 600000));
+const maxInteractiveSessions = Math.max(1, Number(process.env.WEBQUEST_INTERACTIVE_MAX_SESSIONS || 12));
+const interactiveSessions = new Map();
 const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
 
@@ -110,6 +113,12 @@ async function closeSharedBrowser(reason = "") {
 
 async function recycleBrowserIfNeeded() {
   if (!browserPromise || activeAnalyses > 0) {
+    return;
+  }
+
+  await cleanupInteractiveSessions();
+
+  if (interactiveSessions.size > 0) {
     return;
   }
 
@@ -408,6 +417,273 @@ async function analyzePage(url, analyzer, options = {}) {
   } finally {
     await context.close().catch(() => {});
   }
+}
+
+async function closeInteractiveSession(session) {
+  if (!session) {
+    return;
+  }
+
+  await session.context?.close().catch(() => {});
+}
+
+async function cleanupInteractiveSessions(force = false) {
+  const now = Date.now();
+  const expired = [];
+
+  for (const [id, session] of interactiveSessions.entries()) {
+    if (force || now - session.lastUsedAt > interactiveSessionTtlMs) {
+      expired.push([id, session]);
+    }
+  }
+
+  for (const [id, session] of expired) {
+    interactiveSessions.delete(id);
+    await closeInteractiveSession(session);
+  }
+}
+
+async function trimInteractiveSessions() {
+  await cleanupInteractiveSessions();
+
+  while (interactiveSessions.size >= maxInteractiveSessions) {
+    const oldest = Array.from(interactiveSessions.entries())
+      .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)[0];
+
+    if (!oldest) {
+      return;
+    }
+
+    interactiveSessions.delete(oldest[0]);
+    await closeInteractiveSession(oldest[1]);
+  }
+}
+
+async function startInteractiveSession(url, options = {}) {
+  await trimInteractiveSessions();
+
+  const browser = await getBrowser();
+  const viewport = options.viewport || defaultViewport;
+  const context = await browser.newContext(browserContextOptions({ viewport }));
+  const page = await context.newPage();
+  const id = crypto.randomUUID();
+
+  try {
+    await gotoForAnalysis(page, url, 45000);
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+  } catch (error) {
+    await context.close().catch(() => {});
+    throw error;
+  }
+
+  const session = {
+    id,
+    context,
+    page,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now(),
+  };
+
+  interactiveSessions.set(id, session);
+  return session;
+}
+
+function publicInteractiveResult(session, elements) {
+  return {
+    ok: true,
+    engine: "playwright-interactive",
+    sessionId: session.id,
+    url: session.page.url(),
+    title: "",
+    total: elements.length,
+    truncated: elements.truncated || false,
+    elements,
+  };
+}
+
+async function getInteractiveElements(session) {
+  session.lastUsedAt = Date.now();
+  const page = session.page;
+  const title = await page.title().catch(() => "");
+  const data = await page.evaluate(() => {
+    const selector = [
+      "a[href]",
+      "button",
+      "input",
+      "select",
+      "textarea",
+      "summary",
+      "[role='button']",
+      "[role='link']",
+      "[role='checkbox']",
+      "[role='radio']",
+      "[role='switch']",
+      "[role='tab']",
+      "[role='menuitem']",
+      "[tabindex]",
+      "[onclick]",
+    ].join(",");
+    const maxItems = 200;
+    const seen = new Set();
+
+    function clean(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isVisible(element) {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+
+      return style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        style.opacity !== "0" &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        !element.hidden &&
+        element.getAttribute("aria-hidden") !== "true";
+    }
+
+    function labelText(element) {
+      const id = element.id;
+      const labelledby = clean(element.getAttribute("aria-labelledby"))
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((labelId) => clean(document.getElementById(labelId)?.innerText || document.getElementById(labelId)?.textContent))
+        .filter(Boolean)
+        .join(" ");
+      const explicitLabel = id
+        ? clean(Array.from(document.querySelectorAll(`label[for="${String(id).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"]`))
+          .map((label) => label.innerText || label.textContent)
+          .join(" "))
+        : "";
+      const wrappedLabel = clean(element.closest("label")?.innerText || "");
+
+      return clean(
+        labelledby ||
+        element.getAttribute("aria-label") ||
+        explicitLabel ||
+        wrappedLabel ||
+        element.getAttribute("alt") ||
+        element.getAttribute("value") ||
+        element.getAttribute("title") ||
+        element.innerText ||
+        element.textContent ||
+        element.getAttribute("placeholder") ||
+        element.getAttribute("name") ||
+        element.id
+      );
+    }
+
+    function typeOf(element) {
+      const tag = element.tagName.toLowerCase();
+      const role = element.getAttribute("role");
+
+      if (role) {
+        return `${tag}, role=${role}`;
+      }
+
+      if (tag === "input") {
+        return `${tag}, type=${element.getAttribute("type") || "text"}`;
+      }
+
+      return tag;
+    }
+
+    function where(element) {
+      if (element.id) {
+        return `#${element.id}`;
+      }
+
+      const classes = clean(element.className).split(/\s+/).filter(Boolean).slice(0, 3);
+      if (classes.length) {
+        return `${element.tagName.toLowerCase()}.${classes.join(".")}`;
+      }
+
+      return element.tagName.toLowerCase();
+    }
+
+    const result = [];
+
+    Array.from(document.querySelectorAll(selector)).forEach((element) => {
+      if (!(element instanceof HTMLElement) || !isVisible(element) || result.length >= maxItems) {
+        return;
+      }
+
+      if (element.matches("[tabindex='-1']") && !element.matches("a[href], button, input, select, textarea, summary, [role], [onclick]")) {
+        return;
+      }
+
+      if (seen.has(element)) {
+        return;
+      }
+
+      seen.add(element);
+      const index = result.length + 1;
+      element.setAttribute("data-webquest-interactive-index", String(index));
+
+      result.push({
+        number: index,
+        type: typeOf(element),
+        name: labelText(element).slice(0, 180),
+        href: element.href || "",
+        disabled: Boolean(element.disabled || element.getAttribute("aria-disabled") === "true"),
+        expanded: element.getAttribute("aria-expanded") || "",
+        controls: element.getAttribute("aria-controls") || "",
+        where: where(element),
+      });
+    });
+
+    return {
+      items: result,
+      truncated: document.querySelectorAll(selector).length > maxItems,
+    };
+  });
+
+  const elements = Array.isArray(data.items) ? data.items : [];
+  const response = publicInteractiveResult(session, elements);
+  response.title = title;
+  response.truncated = Boolean(data.truncated);
+  return response;
+}
+
+async function clickInteractiveElement(session, number) {
+  session.lastUsedAt = Date.now();
+  const index = Number.parseInt(String(number || ""), 10);
+
+  if (!Number.isFinite(index) || index < 1) {
+    throw new Error("Skriv nummeret på et interaktivt element.");
+  }
+
+  const page = session.page;
+  const locator = page.locator(`[data-webquest-interactive-index="${index}"]`).first();
+  const count = await locator.count();
+
+  if (!count) {
+    throw new Error("Elementet finnes ikke lenger. Kjør Interaktive elementer på nytt.");
+  }
+
+  const popupPromise = page.waitForEvent("popup", { timeout: 6000 }).catch(() => null);
+  const navigationPromise = page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 8000 }).catch(() => null);
+
+  await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+  await locator.click({ timeout: 8000 });
+
+  const popup = await popupPromise;
+  await navigationPromise;
+
+  if (popup) {
+    await page.close().catch(() => {});
+    session.page = popup;
+  }
+
+  await session.page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
+  await session.page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+
+  return getInteractiveElements(session);
 }
 
 async function handleCookieChoice(page, options = {}) {
@@ -7521,6 +7797,86 @@ app.get("/analyze", async (req, res) => {
     return;
   }
 
+  if (command === "closeinteractive") {
+    const sessionId = String(req.query.sessionId || "").trim();
+    const session = interactiveSessions.get(sessionId);
+
+    if (session) {
+      interactiveSessions.delete(sessionId);
+      await closeInteractiveSession(session);
+    }
+
+    res.json({ ok: true, engine: "playwright-interactive" });
+    return;
+  }
+
+  if (command === "interactiveelements") {
+    try {
+      await cleanupInteractiveSessions();
+      const sessionId = String(req.query.sessionId || "").trim();
+      const closeSessionId = String(req.query.closeSessionId || "").trim();
+
+      if (closeSessionId) {
+        const oldSession = interactiveSessions.get(closeSessionId);
+
+        if (oldSession) {
+          interactiveSessions.delete(closeSessionId);
+          await closeInteractiveSession(oldSession);
+        }
+      }
+
+      let session = sessionId ? interactiveSessions.get(sessionId) : null;
+
+      if (!session) {
+        if (!requestedUrl) {
+          res.status(400).json({
+            ok: false,
+            error: 'Du må angi en URL eller velge en standard URL med kommandoen "Velg URL".',
+          });
+          return;
+        }
+
+        const url = await validatePublicUrl(requestedUrl);
+        session = await startInteractiveSession(url, { viewport });
+      }
+
+      res.json(await getInteractiveElements(session));
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: friendlyErrorMessage(error, "Jeg fikk ikke hentet interaktive elementer."),
+      });
+    }
+
+    return;
+  }
+
+  if (command === "interactiveclick") {
+    try {
+      await cleanupInteractiveSessions();
+      const sessionId = String(req.query.sessionId || "").trim();
+      const index = String(req.query.index || "").trim();
+      const session = interactiveSessions.get(sessionId);
+
+      if (!session) {
+        res.status(404).json({
+          ok: false,
+          error: "Den interaktive økten finnes ikke lenger. Kjør Interaktive elementer på nytt.",
+        });
+        return;
+      }
+
+      res.json(await clickInteractiveElement(session, index));
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: friendlyErrorMessage(error, "Jeg fikk ikke aktivert elementet."),
+      });
+    }
+
+    return;
+  }
+
   if (command === "startdomainjob") {
     if (!requestedUrl) {
       res.status(400).json({
@@ -7676,6 +8032,8 @@ app.listen(port, () => {
 });
 
 process.on("SIGTERM", async () => {
+  await cleanupInteractiveSessions(true);
+
   if (persistentContextPromise) {
     const context = await persistentContextPromise;
     await context.close();
