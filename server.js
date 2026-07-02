@@ -5840,7 +5840,8 @@ async function getRobotsInfo(pageUrl) {
     });
     const text = await response.text();
     const contentType = response.headers.get("content-type") || "";
-    const parsed = response.ok ? parseRobotsText(text) : { groups: [], sitemaps: [], issues: [] };
+    const hasRobotsText = response.ok;
+    const parsed = hasRobotsText ? parseRobotsText(text) : { groups: [], sitemaps: [], issues: [] };
     const issues = [...parsed.issues];
 
     if (response.status === 404) {
@@ -5860,13 +5861,13 @@ async function getRobotsInfo(pageUrl) {
       ok: response.ok,
       status: response.status,
       statusText: response.statusText || "",
-      contentType,
-      size: Buffer.byteLength(text, "utf8"),
-      lineCount: text ? text.split(/\r?\n/).length : 0,
+      contentType: hasRobotsText ? contentType : "",
+      size: hasRobotsText ? Buffer.byteLength(text, "utf8") : 0,
+      lineCount: hasRobotsText && text ? text.split(/\r?\n/).length : 0,
       ...parsed,
       issues,
-      textPreview: text.slice(0, 5000),
-      truncated: text.length > 5000,
+      textPreview: hasRobotsText ? text.slice(0, 5000) : "",
+      truncated: hasRobotsText && text.length > 5000,
     };
   } finally {
     clearTimeout(timeout);
