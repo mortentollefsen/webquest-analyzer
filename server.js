@@ -6063,6 +6063,22 @@ function extractEmailsFromHtml(html, pageUrl) {
     });
   }
 
+  function sourceContext(index, length) {
+    const start = Math.max(0, index - 500);
+    const end = Math.min(source.length, index + length + 500);
+    return decodeHtmlEntities(source.slice(start, end).replace(/\\\//g, "/"));
+  }
+
+  function nearbyText(index, length) {
+    const context = sourceContext(index, length);
+    const textMatch = context.match(/["']text["']\s*:\s*["']([^"']{1,120})["']/i) ||
+      context.match(/>\s*([^<>]{1,120})\s*</);
+
+    return textMatch ? decodeHtmlEntities(textMatch[1]).replace(/\\u([0-9a-f]{4})/gi, (_, code) =>
+      String.fromCharCode(Number.parseInt(code, 16))
+    ) : "";
+  }
+
   const mailtoPattern = /<a\b[^>]*\bhref\s*=\s*(["'])\s*mailto:([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
 
   for (const match of source.matchAll(mailtoPattern)) {
@@ -6079,6 +6095,23 @@ function extractEmailsFromHtml(html, pageUrl) {
     }));
   }
 
+  const sourceCodeText = decodeHtmlEntities(source)
+    .replace(/\\\//g, "/")
+    .replace(/\\u0040/gi, "@")
+    .replace(/\\x40/gi, "@");
+  const rawMailtoPattern = /mailto:([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?:\?[^"' <>{}\\]*)?)/gi;
+
+  for (const match of sourceCodeText.matchAll(rawMailtoPattern)) {
+    const href = `mailto:${match[1] || ""}`;
+    addEmail({
+      source: "sidekode",
+      linkText: nearbyText(match.index || 0, match[0].length),
+      nameSource: "sidekode",
+      email: match[1],
+      href,
+    });
+  }
+
   const textWithoutMailtoLinks = source.replace(mailtoPattern, " ");
   const text = stripHtmlText(textWithoutMailtoLinks);
 
@@ -6088,6 +6121,34 @@ function extractEmailsFromHtml(html, pageUrl) {
       email: match[0],
     });
   }
+
+  for (const match of sourceCodeText.matchAll(emailPattern)) {
+    addEmail({
+      source: "sidekode",
+      linkText: nearbyText(match.index || 0, match[0].length),
+      nameSource: "sidekode",
+      email: match[0],
+    });
+  }
+
+  return results;
+}
+
+function mergeEmailResults(primary, secondary) {
+  const results = [];
+  const seen = new Set();
+
+  [...(primary || []), ...(secondary || [])].forEach((item) => {
+    const email = normalizeEmail(item.email);
+    const key = `${email.toLowerCase()}|${item.source || ""}|${item.pageUrl || ""}|${item.href || ""}`;
+
+    if (!email || seen.has(key)) {
+      return;
+    }
+
+    seen.add(key);
+    results.push({ ...item, email });
+  });
 
   return results;
 }
@@ -7753,12 +7814,15 @@ const analyzers = {
   },
   emails: async (page, url) => {
     const result = await page.evaluate(collectAccessibilityData, "emails");
+    const sourceEmails = await getSource(url)
+      .then((source) => extractEmailsFromHtml(source, url))
+      .catch(() => []);
 
     return {
       ok: true,
-      engine: "playwright",
+      engine: "playwright+html-source",
       url,
-      ...result,
+      emails: mergeEmailResults(result.emails || [], sourceEmails),
     };
   },
   videos: async (page, url) => ({
