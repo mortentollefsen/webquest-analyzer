@@ -5685,6 +5685,124 @@ async function getWcag(page) {
   });
 }
 
+function countWcagNodes(wcag) {
+  return Object.values(wcag?.groups || {})
+    .flat()
+    .reduce((sum, rule) => sum + (Number(rule.count) || 0), 0);
+}
+
+function flatFields(groups) {
+  return (Array.isArray(groups) ? groups : []).flatMap((group) => group.fields || []);
+}
+
+async function getSummary(page, url, options = {}) {
+  const startedAt = Date.now();
+  const titleInfo = await getTitleInfo(page);
+  const language = await getLanguage(page);
+  const headings = await getHeadings(page);
+  const landmarks = await getLandmarks(page);
+  const fields = await getFields(page);
+  const links = await getLinks(page);
+  const images = await getImages(page);
+  const contrast = await getContrast(page);
+  const aria = await getAriaIssues(page);
+  const wcag = await getWcag(page);
+  const html = await getHtmlValidation(url).catch((error) => ({
+    valid: false,
+    errorCount: 0,
+    warningCount: 0,
+    messageCount: 0,
+    messages: [],
+    error: friendlyErrorMessage(error, "HTML-koden kunne ikke valideres."),
+  }));
+  const brokenLinks = await getBrokenLinks(page, url, options).catch((error) => ({
+    linksTotal: 0,
+    checked: [],
+    skipped: [],
+    broken: [],
+    error: friendlyErrorMessage(error, "Lenker kunne ikke sjekkes."),
+  }));
+  const hiddenCookieBanners = await countHiddenCookieOverlays(page).catch(() => 0);
+  const allFields = flatFields(fields);
+  const h1Count = headings.filter((heading) => heading.level === 1).length;
+  const fieldMissingNames = allFields.filter((field) => !field.name).length;
+  const linkMissingNames = (links.links || []).filter((link) => !link.name).length;
+  const imagesMissingAccessibleName = images.filter((image) =>
+    !image.isDecorative &&
+    !image.name &&
+    !image.ownerName &&
+    image.elementType !== "css-background"
+  ).length;
+  const imagesMissingAlt = images.filter((image) => image.altStatus === "mangler alt").length;
+  const wcagViolations = Number(wcag.summary?.violations) || 0;
+  const wcagNodes = countWcagNodes(wcag);
+  const contrastFailures = (contrast.aaFailures || []).length;
+  const htmlErrors = Number(html.errorCount) || 0;
+  const brokenCount = (brokenLinks.broken || []).length;
+  const landmarkIssues = (landmarks.issues || []).length + (landmarks.outsideItems || []).length;
+  const priorities = [];
+
+  function addPriority(condition, text, command) {
+    if (condition && priorities.length < 6) {
+      priorities.push({ text, command });
+    }
+  }
+
+  addPriority(wcagViolations > 0, `${wcagViolations} WCAG-regler har funn (${wcagNodes} forekomster).`, "Wcag");
+  addPriority(fieldMissingNames > 0, `${fieldMissingNames} skjemafelt eller knapper mangler navn.`, "Felt");
+  addPriority(imagesMissingAccessibleName > 0 || imagesMissingAlt > 0, `${imagesMissingAccessibleName} bilder mangler accessible name, ${imagesMissingAlt} mangler alt-attributt.`, "Bilder");
+  addPriority(contrastFailures > 0, `${contrastFailures} tekstforekomster feiler AA-kontrast.`, "Kontrast");
+  addPriority(htmlErrors > 0, `${htmlErrors} HTML-feil funnet.`, "HTML");
+  addPriority(brokenCount > 0, `${brokenCount} brutte lenker funnet på siden.`, "Brutte lenker");
+  addPriority((links.issues || []).length > 0 || linkMissingNames > 0, `${(links.issues || []).length} mulige lenkeproblemer, ${linkMissingNames} lenker uten navn.`, "Lenker");
+  addPriority(landmarkIssues > 0, `${landmarkIssues} mulige landemerkeproblemer eller innhold utenfor landemerker.`, "Landemerker");
+  addPriority((aria.issues || []).length > 0, `${(aria.issues || []).length} mulige ARIA-problemer.`, "Aria");
+
+  if (!priorities.length) {
+    priorities.push({ text: "Ingen tydelige problemer funnet i hurtigoppsummeringen.", command: "" });
+  }
+
+  return {
+    title: titleInfo.title || "",
+    h1: titleInfo.h1 || "",
+    language,
+    headings: {
+      total: headings.length,
+      h1: h1Count,
+      empty: headings.filter((heading) => heading.text === "(tom overskrift)").length,
+    },
+    counts: {
+      landmarks: (landmarks.landmarks || []).length,
+      links: (links.links || []).length,
+      images: images.length,
+      fields: allFields.length,
+      tables: await page.locator("table").count().catch(() => 0),
+      iframes: await page.locator("iframe").count().catch(() => 0),
+    },
+    issues: {
+      wcagRules: wcagViolations,
+      wcagOccurrences: wcagNodes,
+      wcagIncomplete: Number(wcag.summary?.incomplete) || 0,
+      htmlErrors,
+      htmlWarnings: Number(html.warningCount) || 0,
+      htmlError: html.error || "",
+      contrastAA: contrastFailures,
+      fieldsMissingNames: fieldMissingNames,
+      links: (links.issues || []).length,
+      linksMissingNames: linkMissingNames,
+      imagesMissingAccessibleName,
+      imagesMissingAlt,
+      landmarks: landmarkIssues,
+      aria: (aria.issues || []).length,
+      brokenLinks: brokenCount,
+      brokenLinksError: brokenLinks.error || "",
+      hiddenCookieBanners,
+    },
+    priorities,
+    elapsedMs: Date.now() - startedAt,
+  };
+}
+
 async function getSource(url) {
   const response = await fetch(url, {
     method: "GET",
@@ -5699,6 +5817,135 @@ async function getSource(url) {
   }
 
   return response.text();
+}
+
+function robotsUrlFor(pageUrl) {
+  const parsed = new URL(pageUrl);
+  return `${parsed.origin}/robots.txt`;
+}
+
+async function getRobotsInfo(pageUrl) {
+  const robotsUrl = await validatePublicUrl(robotsUrlFor(pageUrl));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const response = await fetch(robotsUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+      },
+    });
+    const text = await response.text();
+    const contentType = response.headers.get("content-type") || "";
+    const parsed = response.ok ? parseRobotsText(text) : { groups: [], sitemaps: [], issues: [] };
+    const issues = [...parsed.issues];
+
+    if (response.status === 404) {
+      issues.push("robots.txt finnes ikke på domenet.");
+    } else if (!response.ok) {
+      issues.push(`robots.txt kunne hentes, men serveren svarte HTTP ${response.status}.`);
+    }
+
+    if (response.ok && contentType && !/text|plain|octet-stream/i.test(contentType)) {
+      issues.push(`Uventet content-type: ${contentType}.`);
+    }
+
+    return {
+      robotsUrl,
+      finalUrl: response.url || robotsUrl,
+      exists: response.status !== 404,
+      ok: response.ok,
+      status: response.status,
+      statusText: response.statusText || "",
+      contentType,
+      size: Buffer.byteLength(text, "utf8"),
+      lineCount: text ? text.split(/\r?\n/).length : 0,
+      ...parsed,
+      issues,
+      textPreview: text.slice(0, 5000),
+      truncated: text.length > 5000,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseRobotsText(text) {
+  const groups = [];
+  const sitemaps = [];
+  const issues = [];
+  let currentGroup = null;
+
+  function ensureGroup() {
+    if (!currentGroup) {
+      currentGroup = { userAgents: [], rules: [], crawlDelay: "", other: [] };
+      groups.push(currentGroup);
+    }
+
+    return currentGroup;
+  }
+
+  String(text || "").split(/\r?\n/).forEach((line, index) => {
+    const withoutComment = line.replace(/\s+#.*$/, "").trim();
+
+    if (!withoutComment) {
+      return;
+    }
+
+    const match = withoutComment.match(/^([^:]+):(.*)$/);
+
+    if (!match) {
+      issues.push(`Linje ${index + 1} kunne ikke tolkes: ${withoutComment.slice(0, 80)}`);
+      return;
+    }
+
+    const directive = match[1].trim().toLowerCase();
+    const value = match[2].trim();
+
+    if (directive === "user-agent") {
+      if (!currentGroup || currentGroup.rules.length || currentGroup.crawlDelay || currentGroup.other.length) {
+        currentGroup = { userAgents: [], rules: [], crawlDelay: "", other: [] };
+        groups.push(currentGroup);
+      }
+
+      currentGroup.userAgents.push(value || "(tom)");
+      return;
+    }
+
+    if (directive === "sitemap") {
+      sitemaps.push(value);
+      return;
+    }
+
+    const group = ensureGroup();
+
+    if (directive === "allow" || directive === "disallow") {
+      group.rules.push({ type: directive, path: value || "(tom)" });
+    } else if (directive === "crawl-delay") {
+      group.crawlDelay = value;
+    } else {
+      group.other.push({ directive, value });
+    }
+  });
+
+  groups.forEach((group) => {
+    if (!group.userAgents.length) {
+      group.userAgents.push("(ikke angitt)");
+    }
+
+    if (group.rules.some((rule) => rule.type === "disallow" && rule.path === "/")) {
+      issues.push(`User-agent ${group.userAgents.join(", ")} har Disallow: / og blokkerer dermed hele nettstedet for den roboten.`);
+    }
+  });
+
+  return {
+    groups,
+    sitemaps,
+    issues,
+  };
 }
 
 function normalizeEmail(value) {
@@ -7537,6 +7784,12 @@ const analyzers = {
     url,
     images: await getImages(page),
   }),
+  summary: async (page, url, options = {}) => ({
+    ok: true,
+    engine: "playwright+axe-core+html-validate",
+    url,
+    summary: await getSummary(page, url, options),
+  }),
   landmarks: async (page, url) => {
     const result = await getLandmarks(page);
 
@@ -7558,6 +7811,12 @@ const analyzers = {
     engine: "playwright",
     url,
     meta: await getMetaInfo(page),
+  }),
+  robots: async (page, url) => ({
+    ok: true,
+    engine: "fetch+robots-parser",
+    url,
+    robots: await getRobotsInfo(url),
   }),
   cookies: async (page, url) => ({
     ok: true,
@@ -8007,6 +8266,16 @@ app.get("/analyze", async (req, res) => {
         url,
         source: formatHtmlSource(source),
         sourceCharacters: source.length,
+      });
+      return;
+    }
+
+    if (command === "robots") {
+      res.json({
+        ok: true,
+        engine: "fetch+robots-parser",
+        url,
+        robots: await getRobotsInfo(url),
       });
       return;
     }
