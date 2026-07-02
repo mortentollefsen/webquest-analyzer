@@ -6059,6 +6059,7 @@ function extractEmailsFromHtml(html, pageUrl) {
       email,
       href: item.href || "",
       selector: item.selector || "",
+      usage: item.usage || "",
       pageUrl,
     });
   }
@@ -6077,6 +6078,26 @@ function extractEmailsFromHtml(html, pageUrl) {
     return textMatch ? decodeHtmlEntities(textMatch[1]).replace(/\\u([0-9a-f]{4})/gi, (_, code) =>
       String.fromCharCode(Number.parseInt(code, 16))
     ) : "";
+  }
+
+  function likelyUsage(index, length) {
+    const context = sourceContext(index, length);
+    const text = nearbyText(index, length);
+    const lower = context.toLowerCase();
+
+    if (/["']action["']\s*:\s*["']mail["']/i.test(context) || lower.includes("widget.button")) {
+      return text ? `Knapp: ${text}` : "Knapp i sidekode";
+    }
+
+    if (/<a\b/i.test(context) || /["']href["']\s*:/i.test(context)) {
+      return text ? `Lenke: ${text}` : "Lenke i sidekode";
+    }
+
+    if (/form|contact|kontakt/i.test(context)) {
+      return text ? `Kontaktfunksjon: ${text}` : "Kontaktfunksjon i sidekode";
+    }
+
+    return "";
   }
 
   const mailtoPattern = /<a\b[^>]*\bhref\s*=\s*(["'])\s*mailto:([\s\S]*?)\1[^>]*>([\s\S]*?)<\/a>/gi;
@@ -6109,6 +6130,7 @@ function extractEmailsFromHtml(html, pageUrl) {
       nameSource: "sidekode",
       email: match[1],
       href,
+      usage: likelyUsage(match.index || 0, match[0].length),
     });
   }
 
@@ -6128,6 +6150,7 @@ function extractEmailsFromHtml(html, pageUrl) {
       linkText: nearbyText(match.index || 0, match[0].length),
       nameSource: "sidekode",
       email: match[0],
+      usage: likelyUsage(match.index || 0, match[0].length),
     });
   }
 
