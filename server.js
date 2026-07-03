@@ -854,6 +854,16 @@ async function handleCookieChoice(page, options = {}) {
 
 async function detectCookieBanner(page) {
   for (const frame of page.frames()) {
+    if (shouldSkipCookieFrame(page, frame)) {
+      continue;
+    }
+
+    const hasSignal = await frameHasCookieSignal(frame).catch(() => false);
+
+    if (!hasSignal) {
+      continue;
+    }
+
     const result = await frame.evaluate(() => {
     const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot/i;
     const weakKeywordPattern = /personvern|privacy/i;
@@ -1078,10 +1088,92 @@ async function detectCookieBanner(page) {
   return null;
 }
 
+function shouldSkipCookieFrame(page, frame) {
+  if (frame === page.mainFrame()) {
+    return false;
+  }
+
+  const frameUrl = frame.url();
+
+  if (!frameUrl || /^(about:blank|javascript:|data:)/i.test(frameUrl)) {
+    return true;
+  }
+
+  let frameHost = "";
+  let pageHost = "";
+
+  try {
+    frameHost = new URL(frameUrl).hostname.replace(/^www\./i, "").toLowerCase();
+    pageHost = new URL(page.url()).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return true;
+  }
+
+  if (frameHost === pageHost || frameHost.endsWith(`.${pageHost}`)) {
+    return false;
+  }
+
+  if (/cookiebot|onetrust|usercentrics|didomi|trustarc|quantcast|consent|cookieinformation|privacy/i.test(frameHost)) {
+    return false;
+  }
+
+  return true;
+}
+
+async function frameHasCookieSignal(frame) {
+  return frame.evaluate(() => {
+    const text = String(document.body?.textContent || "")
+      .replace(/\s+/g, " ")
+      .slice(0, 25000);
+    const explicitSelector = [
+      "#CybotCookiebotDialog",
+      "#onetrust-banner-sdk",
+      "#onetrust-consent-sdk",
+      "#usercentrics-root",
+      "#coi-banner-wrapper",
+      "[id*='cookie' i]",
+      "[class*='cookie' i]",
+      "[id*='consent' i]",
+      "[class*='consent' i]",
+      "[id*='samtykke' i]",
+      "[class*='samtykke' i]",
+      "[data-testid*='cookie' i]",
+      "[data-testid*='consent' i]",
+    ].join(",");
+
+    if (/cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot|didomi|trustarc|quantcast/i.test(text)) {
+      return true;
+    }
+
+    if (document.querySelector(explicitSelector)) {
+      return true;
+    }
+
+    const controls = Array.from(document.querySelectorAll("button, a[href], input[type='button'], input[type='submit'], [role='button']"))
+      .slice(0, 80);
+
+    return controls.some((control) => {
+      const label = String(
+        control.getAttribute("aria-label") ||
+        control.value ||
+        control.textContent ||
+        control.title ||
+        ""
+      ).replace(/\s+/g, " ").trim();
+
+      return /^(godta|godkjenn|aksepter|accept|allow|agree|avvis|avslå|decline|reject|bare nødvendige|kun nødvendige|necessary|lagre innstillinger|save settings)$/i.test(label);
+    });
+  });
+}
+
 async function clickCookieControl(page, choice) {
   let clickResult = { clicked: false };
 
   for (const frame of page.frames()) {
+    if (shouldSkipCookieFrame(page, frame)) {
+      continue;
+    }
+
     clickResult = await frame.evaluate(async (rawChoice) => {
     const keywordPattern = /cookie|cookies|informasjonskaps|samtykke|consent|gdpr|usercentrics|onetrust|cookiebot/i;
     const weakKeywordPattern = /personvern|privacy/i;
