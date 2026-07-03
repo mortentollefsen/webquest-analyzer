@@ -1666,6 +1666,7 @@ function collectAccessibilityData(mode) {
 
       if (
         node.hasAttribute("hidden") ||
+        node.getAttribute("aria-hidden") === "true" ||
         style.display === "none" ||
         style.visibility === "hidden" ||
         style.visibility === "collapse" ||
@@ -1711,7 +1712,11 @@ function collectAccessibilityData(mode) {
       return normalized(node.textContent);
     }
 
-    if (!(node instanceof Element) || isHidden(node, options) || node.getAttribute("aria-hidden") === "true") {
+    if (
+      !(node instanceof Element) ||
+      isHidden(node, options) ||
+      (!options.allowHidden && node.getAttribute("aria-hidden") === "true")
+    ) {
       return "";
     }
 
@@ -1785,7 +1790,46 @@ function collectAccessibilityData(mode) {
     const role = normalized(element.getAttribute("role")).toLowerCase();
 
     return ["a", "button", "summary", "option", "legend", "label"].includes(tag) ||
-      ["button", "link", "menuitem", "option", "tab", "treeitem"].includes(role);
+      [
+        "button",
+        "checkbox",
+        "gridcell",
+        "link",
+        "menuitem",
+        "menuitemcheckbox",
+        "menuitemradio",
+        "option",
+        "radio",
+        "row",
+        "switch",
+        "tab",
+        "treeitem",
+      ].includes(role);
+  }
+
+  function roleRequiresName(role) {
+    return new Set([
+      "button",
+      "checkbox",
+      "combobox",
+      "grid",
+      "link",
+      "listbox",
+      "menuitem",
+      "menuitemcheckbox",
+      "menuitemradio",
+      "radio",
+      "radiogroup",
+      "searchbox",
+      "slider",
+      "spinbutton",
+      "switch",
+      "tab",
+      "textbox",
+      "tree",
+      "treegrid",
+      "treeitem",
+    ]).has(role);
   }
 
   function accessibleName(element, options = {}) {
@@ -2399,10 +2443,15 @@ function collectAccessibilityData(mode) {
           return null;
         }
 
+        const name = accessibleName(element);
+
         return {
           element: element.tagName.toLowerCase(),
           selector: selectorFor(element),
           attributes,
+          accessibleName: name.value,
+          nameSource: name.source,
+          hidden: isHidden(element),
           text: normalized(element.innerText || element.textContent).slice(0, 80),
         };
       })
@@ -2455,9 +2504,13 @@ function collectAccessibilityData(mode) {
     });
 
     document.querySelectorAll("[role]").forEach((element) => {
-      const role = normalized(element.getAttribute("role"));
+      const role = normalized(element.getAttribute("role")).toLowerCase();
 
-      if (["button", "link", "checkbox", "radio"].includes(role) && !accessibleName(element).value) {
+      if (isHidden(element)) {
+        return;
+      }
+
+      if (roleRequiresName(role) && !accessibleName(element).value) {
         issues.push(`Element med role="${role}" mangler tilgjengelig navn: ${selectorFor(element)}`);
       }
     });
@@ -4082,8 +4135,8 @@ async function getAriaPointers(page) {
       return parts.join(" > ");
     }
 
-    function isHidden(element) {
-      if (!element || !(element instanceof Element)) {
+    function isHidden(element, options = {}) {
+      if (!element || !(element instanceof Element) || options.allowHidden) {
         return false;
       }
 
@@ -4119,24 +4172,51 @@ async function getAriaPointers(page) {
       return normalized(labels.map((label) => label.innerText || label.textContent).join(" "));
     }
 
+    function textFromSubtree(node, options = {}) {
+      if (!node) {
+        return "";
+      }
+
+      if (node.nodeType === Node.TEXT_NODE) {
+        return normalized(node.textContent);
+      }
+
+      if (
+        !(node instanceof Element) ||
+        isHidden(node, options) ||
+        (!options.allowHidden && node.getAttribute("aria-hidden") === "true")
+      ) {
+        return "";
+      }
+
+      const name = accessibleName(node, { ...options, fromContent: true });
+
+      if (name.value) {
+        return name.value;
+      }
+
+      return normalized(Array.from(node.childNodes).map((child) => textFromSubtree(child, options)).join(" "));
+    }
+
     function svgTitle(element) {
       const title = Array.from(element.children || []).find((child) => child.tagName.toLowerCase() === "title");
       return title ? normalized(title.textContent) : "";
     }
 
-    function accessibleName(element) {
-      if (!(element instanceof Element)) {
+    function accessibleName(element, options = {}) {
+      if (!(element instanceof Element) || isHidden(element, options)) {
         return { value: "", source: "ingen" };
       }
 
       const labelledBy = normalized(element.getAttribute("aria-labelledby"));
 
-      if (labelledBy) {
+      if (!options.fromLabelledBy && labelledBy) {
         const value = normalized(labelledBy
           .split(/\s+/)
           .map((id) => document.getElementById(id))
           .filter(Boolean)
-          .map((target) => target.innerText || target.textContent)
+          .map((target) => accessibleName(target, { allowHidden: true, fromLabelledBy: true }).value ||
+            textFromSubtree(target, { allowHidden: true }))
           .join(" "));
 
         if (value) {
@@ -4146,7 +4226,7 @@ async function getAriaPointers(page) {
 
       const ariaLabel = normalized(element.getAttribute("aria-label"));
 
-      if (ariaLabel) {
+      if (!options.fromContent && ariaLabel) {
         return { value: ariaLabel, source: "aria-label" };
       }
 
@@ -4183,8 +4263,12 @@ async function getAriaPointers(page) {
         }
       }
 
-      if (["a", "button", "summary", "option", "legend", "label"].includes(tag)) {
-        const text = normalized(element.innerText || element.textContent);
+      const role = normalized(element.getAttribute("role")).toLowerCase();
+      const canNameFromContent = ["a", "button", "summary", "option", "legend", "label"].includes(tag) ||
+        ["button", "checkbox", "gridcell", "link", "menuitem", "menuitemcheckbox", "menuitemradio", "option", "radio", "row", "switch", "tab", "treeitem"].includes(role);
+
+      if (options.fromContent || canNameFromContent) {
+        const text = normalized(Array.from(element.childNodes).map((child) => textFromSubtree(child, options)).join(" "));
 
         if (text) {
           return { value: text, source: "innhold" };
