@@ -1929,10 +1929,13 @@ function collectAccessibilityData(mode) {
 
     return {
       kind,
+      element: tagName,
       type: fieldType(element),
       value: fieldValue(element),
       name: name.value,
       nameSource: name.source,
+      text: normalized(element.innerText || element.textContent).slice(0, 120),
+      selector: selectorFor(element),
     };
   }
 
