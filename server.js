@@ -5695,6 +5695,31 @@ function flatFields(groups) {
   return (Array.isArray(groups) ? groups : []).flatMap((group) => group.fields || []);
 }
 
+async function getSummaryPart(label, task, fallback, timeoutMs = 10000) {
+  let timeoutId;
+
+  try {
+    return await Promise.race([
+      task(),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+          resolve({
+            ...fallback,
+            error: `${label} tok for lang tid og ble hoppet over i Oppsummering.`,
+          });
+        }, timeoutMs);
+      }),
+    ]);
+  } catch (error) {
+    return {
+      ...fallback,
+      error: friendlyErrorMessage(error, `${label} kunne ikke kjøres.`),
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function getSummary(page, url, options = {}) {
   const startedAt = Date.now();
   const titleInfo = await getTitleInfo(page);
@@ -5704,25 +5729,30 @@ async function getSummary(page, url, options = {}) {
   const fields = await getFields(page);
   const links = await getLinks(page);
   const images = await getImages(page);
-  const contrast = await getContrast(page);
+  const hiddenCookieBanners = await countHiddenCookieOverlays(page).catch(() => 0);
   const aria = await getAriaIssues(page);
-  const wcag = await getWcag(page);
-  const html = await getHtmlValidation(url).catch((error) => ({
+  const contrast = await getSummaryPart("Kontrast", () => getContrast(page), {
+    aaFailures: [],
+  }, 10000);
+  const wcag = await getSummaryPart("WCAG", () => getWcag(page), {
+    summary: { violations: 0, incomplete: 0, passes: 0 },
+    groups: {},
+    incomplete: [],
+  }, 15000);
+  const html = await getSummaryPart("HTML-validering", () => getHtmlValidation(url), {
     valid: false,
     errorCount: 0,
     warningCount: 0,
     messageCount: 0,
     messages: [],
-    error: friendlyErrorMessage(error, "HTML-koden kunne ikke valideres."),
-  }));
-  const brokenLinks = await getBrokenLinks(page, url, options).catch((error) => ({
+  }, 12000);
+  const brokenLinks = {
     linksTotal: 0,
     checked: [],
     skipped: [],
     broken: [],
-    error: friendlyErrorMessage(error, "Lenker kunne ikke sjekkes."),
-  }));
-  const hiddenCookieBanners = await countHiddenCookieOverlays(page).catch(() => 0);
+    error: "Ikke kjørt i Oppsummering. Bruk Brutte lenker for full lenkesjekk.",
+  };
   const allFields = flatFields(fields);
   const h1Count = headings.filter((heading) => heading.level === 1).length;
   const fieldMissingNames = allFields.filter((field) => !field.name).length;
@@ -5783,10 +5813,12 @@ async function getSummary(page, url, options = {}) {
       wcagRules: wcagViolations,
       wcagOccurrences: wcagNodes,
       wcagIncomplete: Number(wcag.summary?.incomplete) || 0,
+      wcagError: wcag.error || "",
       htmlErrors,
       htmlWarnings: Number(html.warningCount) || 0,
       htmlError: html.error || "",
       contrastAA: contrastFailures,
+      contrastError: contrast.error || "",
       fieldsMissingNames: fieldMissingNames,
       links: (links.issues || []).length,
       linksMissingNames: linkMissingNames,
