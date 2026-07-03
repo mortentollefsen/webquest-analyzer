@@ -35,6 +35,9 @@ const domainJobs = new Map();
 const interactiveSessionTtlMs = Math.max(60000, Number(process.env.WEBQUEST_INTERACTIVE_SESSION_TTL_MS || 600000));
 const maxInteractiveSessions = Math.max(1, Number(process.env.WEBQUEST_INTERACTIVE_MAX_SESSIONS || 12));
 const interactiveSessions = new Map();
+const sessionCookieJarTtlMs = Math.max(60000, Number(process.env.WEBQUEST_SESSION_COOKIE_TTL_MS || 3600000));
+const maxSessionCookieJars = Math.max(1, Number(process.env.WEBQUEST_MAX_SESSION_COOKIE_JARS || 80));
+const sessionCookieJars = new Map();
 const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
 
@@ -66,6 +69,82 @@ function normalizeViewport(widthValue, heightValue) {
     width: Number.isFinite(width) ? Math.min(7680, Math.max(240, width)) : defaultViewport.width,
     height: Number.isFinite(height) ? Math.min(4320, Math.max(200, height)) : defaultViewport.height,
   };
+}
+
+function normalizeClientWindowId(value) {
+  return String(value || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 120);
+}
+
+function cookieDomainFromUrl(url) {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function sessionCookieJarKey(clientWindowId, url) {
+  const id = normalizeClientWindowId(clientWindowId);
+  const domain = cookieDomainFromUrl(url);
+
+  return id && domain ? `${id}:${domain}` : "";
+}
+
+function cleanupSessionCookieJars() {
+  const now = Date.now();
+
+  for (const [key, jar] of sessionCookieJars.entries()) {
+    if (now - jar.lastUsedAt > sessionCookieJarTtlMs) {
+      sessionCookieJars.delete(key);
+    }
+  }
+
+  while (sessionCookieJars.size > maxSessionCookieJars) {
+    const oldest = Array.from(sessionCookieJars.entries())
+      .sort((a, b) => a[1].lastUsedAt - b[1].lastUsedAt)[0];
+
+    if (!oldest) {
+      break;
+    }
+
+    sessionCookieJars.delete(oldest[0]);
+  }
+}
+
+async function applySessionCookies(context, options = {}, url = "") {
+  cleanupSessionCookieJars();
+
+  const key = sessionCookieJarKey(options.clientWindowId, url);
+  const jar = key ? sessionCookieJars.get(key) : null;
+
+  if (!jar || !Array.isArray(jar.cookies) || jar.cookies.length === 0) {
+    return;
+  }
+
+  jar.lastUsedAt = Date.now();
+  await context.addCookies(jar.cookies).catch(() => {});
+}
+
+async function saveSessionCookies(context, options = {}, url = "") {
+  cleanupSessionCookieJars();
+
+  const key = sessionCookieJarKey(options.clientWindowId, url);
+
+  if (!key) {
+    return;
+  }
+
+  const cookies = await context.cookies().catch(() => []);
+
+  if (!Array.isArray(cookies) || cookies.length === 0) {
+    return;
+  }
+
+  sessionCookieJars.set(key, {
+    cookies: cookies.slice(-120),
+    lastUsedAt: Date.now(),
+  });
+  cleanupSessionCookieJars();
 }
 
 async function getBrowser() {
@@ -402,6 +481,7 @@ async function analyzePage(url, analyzer, options = {}) {
 
   const browser = await getBrowser();
   const context = await browser.newContext(browserContextOptions({ viewport }));
+  await applySessionCookies(context, options, url);
   const page = await context.newPage();
   let session;
 
@@ -413,7 +493,9 @@ async function analyzePage(url, analyzer, options = {}) {
       return cookieResult;
     }
 
-    return await withPageInfo(page, analyzer);
+    const result = await withPageInfo(page, analyzer);
+    await saveSessionCookies(context, options, page.url() || url);
+    return result;
   } finally {
     await context.close().catch(() => {});
   }
@@ -465,6 +547,7 @@ async function startInteractiveSession(url, options = {}) {
   const browser = await getBrowser();
   const viewport = options.viewport || defaultViewport;
   const context = await browser.newContext(browserContextOptions({ viewport }));
+  await applySessionCookies(context, options, url);
   const page = await context.newPage();
   const id = crypto.randomUUID();
 
@@ -480,6 +563,7 @@ async function startInteractiveSession(url, options = {}) {
     id,
     context,
     page,
+    clientWindowId: normalizeClientWindowId(options.clientWindowId),
     createdAt: Date.now(),
     lastUsedAt: Date.now(),
   };
@@ -682,6 +766,7 @@ async function clickInteractiveElement(session, number) {
 
   await session.page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => {});
   await session.page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+  await saveSessionCookies(session.context, { clientWindowId: session.clientWindowId }, session.page.url());
 
   return getInteractiveElements(session);
 }
@@ -8119,6 +8204,7 @@ app.get("/analyze", async (req, res) => {
   const cookieChoice = String(req.query.cookieChoice || "").trim();
   const cookieFlow = String(req.query.cookieFlow || "") === "1";
   const viewport = normalizeViewport(req.query.viewportWidth, req.query.viewportHeight);
+  const clientWindowId = normalizeClientWindowId(req.query.windowid || req.query.windowId);
 
   if (command === "describe") {
     if (!requestedUrl) {
@@ -8216,7 +8302,7 @@ app.get("/analyze", async (req, res) => {
         }
 
         const url = await validatePublicUrl(requestedUrl);
-        session = await startInteractiveSession(url, { viewport });
+        session = await startInteractiveSession(url, { viewport, clientWindowId });
       }
 
       res.json(await getInteractiveElements(session));
@@ -8403,7 +8489,7 @@ app.get("/analyze", async (req, res) => {
     const result = await analyzePage(
       url,
       (page) => analyzers[command](page, url, { selector, ignore401, ignore403 }),
-      { cookieChoice, cookieFlow, viewport, forceFreshContext: command === "cookies" }
+      { cookieChoice, cookieFlow, viewport, clientWindowId, forceFreshContext: command === "cookies" }
     );
 
     res.json(result);
