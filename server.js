@@ -39,6 +39,8 @@ const sessionCookieJarTtlMs = Math.max(60000, Number(process.env.WEBQUEST_SESSIO
 const maxSessionCookieJars = Math.max(1, Number(process.env.WEBQUEST_MAX_SESSION_COOKIE_JARS || 80));
 const sessionCookieJars = new Map();
 const serverAdminToken = String(process.env.WEBQUEST_ADMIN_TOKEN || "").trim();
+const serverMessageTtlMs = Math.max(60000, Number(process.env.WEBQUEST_SERVER_MESSAGE_TTL_MS || 300000));
+let serverMessage = null;
 const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
 
@@ -202,7 +204,48 @@ function countDomainJobStatuses() {
   return counts;
 }
 
+function cleanupServerMessage() {
+  if (serverMessage && Date.now() > serverMessage.expiresAt) {
+    serverMessage = null;
+  }
+}
+
+function getPublicServerMessage(sinceId = 0) {
+  cleanupServerMessage();
+
+  const parsedSinceId = Number.parseInt(String(sinceId || "0"), 10) || 0;
+
+  if (!serverMessage || serverMessage.id <= parsedSinceId) {
+    return null;
+  }
+
+  return {
+    id: serverMessage.id,
+    text: serverMessage.text,
+    createdAt: serverMessage.createdAtIso,
+    expiresAt: serverMessage.expiresAtIso,
+  };
+}
+
+function setServerMessage(text) {
+  const now = Date.now();
+  const expiresAt = now + serverMessageTtlMs;
+
+  serverMessage = {
+    id: now,
+    text: String(text || "").trim().slice(0, 2000),
+    createdAt: now,
+    expiresAt,
+    createdAtIso: new Date(now).toISOString(),
+    expiresAtIso: new Date(expiresAt).toISOString(),
+  };
+
+  return getPublicServerMessage(0);
+}
+
 function getServerStatus() {
+  cleanupServerMessage();
+
   return {
     activeAnalyses,
     queuedAnalyses: analysisQueue.length,
@@ -214,6 +257,8 @@ function getServerStatus() {
     persistentContextStarted: Boolean(persistentContextPromise),
     browserUseCount,
     rssMb: currentRssMb(),
+    serverMessageActive: Boolean(serverMessage),
+    serverMessageExpiresAt: serverMessage?.expiresAtIso || "",
     limits: {
       maxConcurrentAnalyses,
       maxQueuedAnalyses,
@@ -228,6 +273,7 @@ function getServerStatus() {
       sessionCookieJarTtlMs,
       maxInteractiveSessions,
       maxSessionCookieJars,
+      serverMessageTtlMs,
     },
   };
 }
@@ -269,6 +315,7 @@ async function resetServerState() {
   domainJobs.clear();
   await cleanupInteractiveSessions(true);
   sessionCookieJars.clear();
+  serverMessage = null;
   await resetPersistentContext();
   await closeSharedBrowser("server reset");
 
@@ -283,6 +330,7 @@ async function resetServerState() {
       sessionCookieJars: before.sessionCookieJars,
       browserClosed: before.browserStarted,
       persistentContextClosed: before.persistentContextStarted,
+      serverMessageCleared: before.serverMessageActive,
       queuedAnalysesKept: before.queuedAnalyses,
       activeAnalysesKept: before.activeAnalyses,
     },
@@ -8452,7 +8500,7 @@ app.options("/analyze", (req, res) => {
 app.use("/analyze", async (req, res, next) => {
   const command = String(req.query.command || "").toLowerCase();
 
-  if (command === "server") {
+  if (command === "server" || command === "servermessage") {
     next();
     return;
   }
@@ -8491,6 +8539,15 @@ app.get("/analyze", async (req, res) => {
   const viewport = normalizeViewport(req.query.viewportWidth, req.query.viewportHeight);
   const clientWindowId = normalizeClientWindowId(req.query.windowid || req.query.windowId);
 
+  if (command === "servermessage") {
+    res.json({
+      ok: true,
+      engine: "server-message",
+      message: getPublicServerMessage(req.query.sinceId),
+    });
+    return;
+  }
+
   if (command === "server") {
     if (!authorizeServerAdmin(req, res)) {
       return;
@@ -8523,6 +8580,26 @@ app.get("/analyze", async (req, res) => {
         });
       }
 
+      return;
+    }
+
+    if (action === "melding") {
+      const text = String(req.query.text || "").trim();
+
+      if (!text) {
+        res.status(400).json({
+          ok: false,
+          error: "Skriv en melding etter server -melding.",
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        engine: "server-admin",
+        message: setServerMessage(text),
+        server: getServerStatus(),
+      });
       return;
     }
 
