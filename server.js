@@ -5606,6 +5606,315 @@ async function getCssResponsive(page, url) {
   return { viewports: results };
 }
 
+async function getScreenshots(page, url) {
+  await hideCookieOverlays(page);
+
+  const viewports = [
+    { name: "mobil", width: 390, height: 844 },
+    { name: "nettbrett", width: 768, height: 1024 },
+    { name: "desktop", width: 1366, height: 900 },
+  ];
+  const images = [];
+
+  for (const viewport of viewports) {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await gotoForAnalysis(page, url, 30000);
+    await hideCookieOverlays(page);
+    await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {});
+
+    const layout = await page.evaluate(() => {
+      const html = document.documentElement;
+      const body = document.body;
+      return {
+        title: document.title || "",
+        pageWidth: Math.max(html.scrollWidth, body.scrollWidth, window.innerWidth),
+        pageHeight: Math.max(html.scrollHeight, body.scrollHeight, window.innerHeight),
+        horizontalScroll: html.scrollWidth > window.innerWidth + 1 || body.scrollWidth > window.innerWidth + 1,
+      };
+    });
+    const screenshot = await page.screenshot({
+      type: "png",
+      fullPage: false,
+    });
+
+    images.push({
+      ...viewport,
+      ...layout,
+      alt: `Skjermbilde ${viewport.name}`,
+      src: `data:image/png;base64,${screenshot.toString("base64")}`,
+    });
+  }
+
+  return {
+    images,
+    hiddenCookieBanners: await countHiddenCookieOverlays(page),
+  };
+}
+
+async function getKeyboardAnalysis(page) {
+  const focusStyles = await getCssFocusStyles(page);
+  const dom = await page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) return `#${CSS.escape(element.id)}`;
+
+      const tag = element.tagName.toLowerCase();
+      const parent = element.parentElement;
+
+      if (!parent) return tag;
+
+      const same = Array.from(parent.children).filter((child) => child.tagName === element.tagName);
+      const index = same.indexOf(element);
+
+      return same.length > 1 ? `${tag}:nth-of-type(${index + 1})` : tag;
+    }
+
+    function visible(element) {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    }
+
+    function nameFor(element) {
+      const labelledby = normalized(element.getAttribute("aria-labelledby"));
+      const ariaLabel = normalized(element.getAttribute("aria-label"));
+
+      if (labelledby) {
+        const text = labelledby
+          .split(/\s+/)
+          .map((id) => document.getElementById(id))
+          .filter(Boolean)
+          .map((target) => normalized(target.innerText || target.textContent))
+          .filter(Boolean)
+          .join(" ");
+
+        if (text) return text;
+      }
+
+      return ariaLabel ||
+        normalized(element.innerText || element.textContent) ||
+        normalized(element.getAttribute("alt")) ||
+        normalized(element.getAttribute("title")) ||
+        normalized(element.getAttribute("value"));
+    }
+
+    const focusableSelector = [
+      "a[href]",
+      "button",
+      "input:not([type='hidden'])",
+      "select",
+      "textarea",
+      "summary",
+      "[tabindex]",
+      "[contenteditable='true']",
+      "[role='button']",
+      "[role='link']",
+      "[role='menuitem']",
+      "[role='checkbox']",
+      "[role='radio']",
+      "[role='switch']",
+    ].join(",");
+    const allCandidates = Array.from(document.querySelectorAll(focusableSelector))
+      .filter((element) => visible(element) && !element.disabled);
+    const focusable = allCandidates
+      .filter((element) => element.tabIndex >= 0)
+      .map((element, index) => ({
+        index: index + 1,
+        element: element.tagName.toLowerCase(),
+        role: normalized(element.getAttribute("role")),
+        name: nameFor(element),
+        text: normalized(element.innerText || element.textContent || element.value).slice(0, 120),
+        tabindex: element.getAttribute("tabindex") ?? "0",
+        selector: selectorFor(element),
+        href: element.getAttribute("href") || "",
+      }));
+    const skipped = allCandidates
+      .filter((element) => element.tabIndex < 0)
+      .map((element) => ({
+        element: element.tagName.toLowerCase(),
+        role: normalized(element.getAttribute("role")),
+        name: nameFor(element),
+        text: normalized(element.innerText || element.textContent || element.value).slice(0, 120),
+        tabindex: element.getAttribute("tabindex") ?? String(element.tabIndex),
+        selector: selectorFor(element),
+      }))
+      .slice(0, 40);
+    const clickableNotFocusable = Array.from(document.querySelectorAll("[onclick], [role='button'], [role='link']"))
+      .filter((element) => visible(element) && element.tabIndex < 0 && !element.matches("button, a[href], input, select, textarea, summary"))
+      .map((element) => ({
+        element: element.tagName.toLowerCase(),
+        role: normalized(element.getAttribute("role")),
+        name: nameFor(element),
+        text: normalized(element.innerText || element.textContent).slice(0, 120),
+        selector: selectorFor(element),
+      }))
+      .slice(0, 40);
+    const positiveTabindex = focusable
+      .filter((item) => Number.parseInt(item.tabindex, 10) > 0)
+      .slice(0, 40);
+    const missingNames = focusable
+      .filter((item) => !item.name)
+      .slice(0, 40);
+    const skipLinks = Array.from(document.querySelectorAll("a[href^='#']"))
+      .filter((element) => visible(element))
+      .map((element) => ({
+        text: nameFor(element),
+        href: element.getAttribute("href") || "",
+        selector: selectorFor(element),
+      }))
+      .filter((item) => /hopp|skip|innhold|content|main/i.test(`${item.text} ${item.href}`))
+      .slice(0, 10);
+
+    return {
+      focusable,
+      skipped,
+      clickableNotFocusable,
+      positiveTabindex,
+      missingNames,
+      skipLinks,
+    };
+  });
+  const visibleFocusMissing = (focusStyles.items || [])
+    .filter((item) => !item.hasVisibleFocus)
+    .map((item) => ({
+      element: item.element,
+      name: item.text || "",
+      selector: item.selector,
+      focusMethod: item.focusMethod,
+    }))
+    .slice(0, 40);
+  const issues = [];
+
+  if (dom.positiveTabindex.length) issues.push("Positiv tabindex kan gi uventet tab-rekkefølge.");
+  if (dom.missingNames.length) issues.push("Noen fokuserbare elementer mangler tilgjengelig navn.");
+  if (visibleFocusMissing.length) issues.push("Noen fokuserbare elementer mangler tydelig synlig fokus.");
+  if (dom.clickableNotFocusable.length) issues.push("Noen klikkbare elementer ser ikke ut til å kunne nås med tastatur.");
+  if (!dom.skipLinks.length && dom.focusable.length > 15) issues.push("Fant ingen tydelig hopp-lenke til hovedinnhold.");
+
+  return {
+    checked: dom.focusable.length,
+    focusable: dom.focusable.slice(0, 120),
+    truncated: dom.focusable.length > 120 || focusStyles.truncated,
+    skipped: dom.skipped,
+    clickableNotFocusable: dom.clickableNotFocusable,
+    positiveTabindex: dom.positiveTabindex,
+    missingNames: dom.missingNames,
+    visibleFocusMissing,
+    skipLinks: dom.skipLinks,
+    focusStylesSummary: {
+      checked: focusStyles.checked,
+      missing: focusStyles.missing,
+      truncated: focusStyles.truncated,
+    },
+    issues,
+  };
+}
+
+async function getDesignAnalysis(page, url) {
+  const screenshots = await getScreenshots(page, url);
+  const responsive = await getCssResponsive(page, url);
+  const focusStyles = await getCssFocusStyles(page);
+  const metrics = await page.evaluate(() => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function selectorFor(element) {
+      if (element.id) return `#${CSS.escape(element.id)}`;
+      return element.tagName.toLowerCase();
+    }
+
+    const textElements = Array.from(document.querySelectorAll("p, li, a, button, label, input, textarea, h1, h2, h3, h4, h5, h6"))
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      });
+    const smallText = textElements
+      .map((element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const size = Number.parseFloat(style.fontSize) || 0;
+        return {
+          element: element.tagName.toLowerCase(),
+          text: normalized(element.innerText || element.value || element.textContent).slice(0, 120),
+          fontSize: Math.round(size * 10) / 10,
+          width: Math.round(rect.width),
+          selector: selectorFor(element),
+        };
+      })
+      .filter((item) => item.fontSize > 0 && item.fontSize < 14)
+      .slice(0, 30);
+    const smallTargets = Array.from(document.querySelectorAll("a[href], button, input, select, textarea, summary, [role='button'], [role='link']"))
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+      })
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return {
+          element: element.tagName.toLowerCase(),
+          text: normalized(element.innerText || element.value || element.getAttribute("aria-label") || element.textContent).slice(0, 120),
+          width: Math.round(rect.width),
+          height: Math.round(rect.height),
+          selector: selectorFor(element),
+        };
+      })
+      .filter((item) => item.width < 32 || item.height < 32)
+      .slice(0, 30);
+    const fixed = Array.from(document.querySelectorAll("body *"))
+      .filter((element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return ["fixed", "sticky"].includes(style.position) && rect.width > 0 && rect.height > 0;
+      })
+      .map((element) => ({
+        element: element.tagName.toLowerCase(),
+        text: normalized(element.innerText || element.textContent).slice(0, 100),
+        position: window.getComputedStyle(element).position,
+        selector: selectorFor(element),
+      }))
+      .slice(0, 20);
+    const h1 = document.querySelector("h1");
+    const bodyStyle = window.getComputedStyle(document.body);
+
+    return {
+      title: document.title || "",
+      h1: h1 ? normalized(h1.innerText || h1.textContent) : "",
+      bodyFont: bodyStyle.fontFamily,
+      bodyColor: bodyStyle.color,
+      bodyBackground: bodyStyle.backgroundColor,
+      smallText,
+      smallTargets,
+      fixed,
+    };
+  });
+  const issues = [];
+  const horizontal = (responsive.viewports || []).filter((item) => item.horizontalScroll);
+
+  if (horizontal.length) issues.push("Siden får horisontal scrolling i noen viewport-størrelser.");
+  if (metrics.smallText.length) issues.push("Noe tekst er mindre enn 14 px.");
+  if (metrics.smallTargets.length) issues.push("Noen klikkbare/fokuserbare mål er mindre enn 32 x 32 px.");
+  if (focusStyles.missing) issues.push("Noen elementer mangler tydelig synlig fokus.");
+  if (metrics.fixed.length > 3) issues.push("Siden har flere sticky/fixed elementer som bør kontrolleres visuelt.");
+
+  return {
+    ...metrics,
+    screenshots,
+    responsive,
+    focusStylesSummary: {
+      checked: focusStyles.checked,
+      missing: focusStyles.missing,
+      truncated: focusStyles.truncated,
+    },
+    issues,
+  };
+}
+
 async function getCssColors(page) {
   return page.evaluate(() => {
     function normalized(text) {
@@ -6198,6 +6507,8 @@ async function getSummary(page, url, options = {}) {
   addPriority((links.issues || []).length > 0 || linkMissingNames > 0, `${(links.issues || []).length} mulige lenkeproblemer, ${linkMissingNames} lenker uten navn.`, "Lenker");
   addPriority(landmarkIssues > 0, `${landmarkIssues} mulige landemerkeproblemer eller innhold utenfor landemerker.`, "Landemerker");
   addPriority((aria.issues || []).length > 0, `${(aria.issues || []).length} mulige ARIA-problemer.`, "Aria");
+  addPriority(allFields.length + (links.links || []).length > 10, "Siden har mange interaktive elementer. Sjekk tab-rekkefølge og tastaturbruk.", "Tastatur");
+  addPriority(true, "Kjør en visuell designsjekk av layout, små klikkmål, små tekster og skjermbilder.", "Design");
 
   if (!priorities.length) {
     priorities.push({ text: "Ingen tydelige problemer funnet i hurtigoppsummeringen.", command: "" });
@@ -8367,6 +8678,12 @@ const analyzers = {
     url,
     focus: await getFocus(page),
   }),
+  keyboard: async (page, url) => ({
+    ok: true,
+    engine: "playwright+keyboard",
+    url,
+    keyboard: await getKeyboardAnalysis(page),
+  }),
   aria: async (page, url) => {
     const result = await getAriaIssues(page);
 
@@ -8452,6 +8769,18 @@ const analyzers = {
     url,
     report: await getScreenReaderReport(page, "structure"),
     mode: "structure",
+  }),
+  screenshots: async (page, url) => ({
+    ok: true,
+    engine: "playwright-screenshot",
+    url,
+    screenshots: await getScreenshots(page, url),
+  }),
+  design: async (page, url) => ({
+    ok: true,
+    engine: "playwright-design",
+    url,
+    design: await getDesignAnalysis(page, url),
   }),
   colorblindprotanopia: async (page, url) => ({
     ok: true,
