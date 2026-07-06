@@ -7090,14 +7090,33 @@ function extractHtmlLinks(html, baseUrl, allowedHosts) {
   const links = [];
   const seen = new Set();
   const hosts = allowedHosts instanceof Set ? allowedHosts : new Set(hostVariants(allowedHosts));
-  const hrefPattern = /<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1/gi;
+  const hrefPatterns = [
+    /<a\b[^>]*\bhref\s*=\s*(["'])([\s\S]*?)\1/gi,
+    /["']href["']\s*:\s*(["'])([\s\S]*?)\1/gi,
+  ];
   const skipExtensions = /\.(?:7z|avi|bmp|css|csv|docx?|eot|gif|gz|ico|jpe?g|js|json|mp3|mp4|mpeg|odt|ogg|pdf|png|pptx?|rar|rss|svg|tar|tiff?|ttf|txt|wav|webm|webp|woff2?|xlsx?|xml|zip)$/i;
 
-  for (const match of html.matchAll(hrefPattern)) {
-    const rawHref = String(match[2] || "").trim();
+  function normalizeEmbeddedHref(value) {
+    let raw = String(value || "").trim();
+
+    if (!raw) {
+      return "";
+    }
+
+    try {
+      raw = JSON.parse(`"${raw.replace(/"/g, '\\"')}"`);
+    } catch {
+      raw = raw.replace(/\\\//g, "/");
+    }
+
+    return decodeHtmlEntities(raw).trim();
+  }
+
+  function addHref(value) {
+    const rawHref = normalizeEmbeddedHref(value);
 
     if (!rawHref || /^(?:mailto:|tel:|javascript:|data:|sms:)/i.test(rawHref)) {
-      continue;
+      return;
     }
 
     let href;
@@ -7105,24 +7124,30 @@ function extractHtmlLinks(html, baseUrl, allowedHosts) {
     try {
       href = new URL(rawHref, baseUrl);
     } catch {
-      continue;
+      return;
     }
 
     href.hash = "";
 
     if (!["http:", "https:"].includes(href.protocol) || !hosts.has(href.hostname.toLowerCase())) {
-      continue;
+      return;
     }
 
     if (skipExtensions.test(href.pathname)) {
-      continue;
+      return;
     }
 
-    const value = href.href;
+    const normalizedHref = href.href;
 
-    if (!seen.has(value)) {
-      seen.add(value);
-      links.push(value);
+    if (!seen.has(normalizedHref)) {
+      seen.add(normalizedHref);
+      links.push(normalizedHref);
+    }
+  }
+
+  for (const hrefPattern of hrefPatterns) {
+    for (const match of String(html || "").matchAll(hrefPattern)) {
+      addHref(match[2] || "");
     }
   }
 
