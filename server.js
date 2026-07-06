@@ -38,6 +38,7 @@ const interactiveSessions = new Map();
 const sessionCookieJarTtlMs = Math.max(60000, Number(process.env.WEBQUEST_SESSION_COOKIE_TTL_MS || 3600000));
 const maxSessionCookieJars = Math.max(1, Number(process.env.WEBQUEST_MAX_SESSION_COOKIE_JARS || 80));
 const sessionCookieJars = new Map();
+const serverAdminToken = String(process.env.WEBQUEST_ADMIN_TOKEN || "").trim();
 const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
 
@@ -188,6 +189,104 @@ async function closeSharedBrowser(reason = "") {
   if (reason) {
     console.log(`Chromium recycled: ${reason}. RSS ${currentRssMb()} MB.`);
   }
+}
+
+function countDomainJobStatuses() {
+  const counts = {};
+
+  for (const job of domainJobs.values()) {
+    const status = job.status || "ukjent";
+    counts[status] = (counts[status] || 0) + 1;
+  }
+
+  return counts;
+}
+
+function getServerStatus() {
+  return {
+    activeAnalyses,
+    queuedAnalyses: analysisQueue.length,
+    domainJobs: domainJobs.size,
+    domainJobStatuses: countDomainJobStatuses(),
+    interactiveSessions: interactiveSessions.size,
+    sessionCookieJars: sessionCookieJars.size,
+    browserStarted: Boolean(browserPromise),
+    persistentContextStarted: Boolean(persistentContextPromise),
+    browserUseCount,
+    rssMb: currentRssMb(),
+    limits: {
+      maxConcurrentAnalyses,
+      maxQueuedAnalyses,
+      recycleBrowserAfterUses,
+      recycleBrowserAfterRssMb,
+      defaultDomainPages,
+      maxDomainPages,
+      defaultDomainSeconds,
+      maxDomainSeconds,
+      domainJobTtlMs,
+      interactiveSessionTtlMs,
+      sessionCookieJarTtlMs,
+      maxInteractiveSessions,
+      maxSessionCookieJars,
+    },
+  };
+}
+
+function authorizeServerAdmin(req, res) {
+  const token = String(req.query.adminToken || req.get("x-webquest-admin-token") || "").trim();
+
+  if (!serverAdminToken) {
+    res.status(403).json({
+      ok: false,
+      error: "Serverkommando er ikke konfigurert på serveren.",
+    });
+    return false;
+  }
+
+  if (!token || token !== serverAdminToken) {
+    res.status(403).json({
+      ok: false,
+      error: "Serverkommando er ikke autorisert.",
+    });
+    return false;
+  }
+
+  return true;
+}
+
+async function resetServerState() {
+  const before = getServerStatus();
+
+  for (const job of domainJobs.values()) {
+    job.cancelled = true;
+    job.result.aborted = true;
+
+    if (job.currentController) {
+      job.currentController.abort();
+    }
+  }
+
+  domainJobs.clear();
+  await cleanupInteractiveSessions(true);
+  sessionCookieJars.clear();
+  await resetPersistentContext();
+  await closeSharedBrowser("server reset");
+
+  const after = getServerStatus();
+
+  return {
+    before,
+    after,
+    reset: {
+      domainJobs: before.domainJobs,
+      interactiveSessions: before.interactiveSessions,
+      sessionCookieJars: before.sessionCookieJars,
+      browserClosed: before.browserStarted,
+      persistentContextClosed: before.persistentContextStarted,
+      queuedAnalysesKept: before.queuedAnalyses,
+      activeAnalysesKept: before.activeAnalyses,
+    },
+  };
 }
 
 async function recycleBrowserIfNeeded() {
@@ -8351,6 +8450,13 @@ app.options("/analyze", (req, res) => {
 });
 
 app.use("/analyze", async (req, res, next) => {
+  const command = String(req.query.command || "").toLowerCase();
+
+  if (command === "server") {
+    next();
+    return;
+  }
+
   try {
     await acquireAnalysisSlot();
   } catch (error) {
@@ -8384,6 +8490,48 @@ app.get("/analyze", async (req, res) => {
   const cookieFlow = String(req.query.cookieFlow || "") === "1";
   const viewport = normalizeViewport(req.query.viewportWidth, req.query.viewportHeight);
   const clientWindowId = normalizeClientWindowId(req.query.windowid || req.query.windowId);
+
+  if (command === "server") {
+    if (!authorizeServerAdmin(req, res)) {
+      return;
+    }
+
+    const action = String(req.query.action || "").trim().toLowerCase();
+
+    if (action === "status") {
+      res.json({
+        ok: true,
+        engine: "server-admin",
+        server: getServerStatus(),
+      });
+      return;
+    }
+
+    if (action === "nullstill") {
+      try {
+        const result = await resetServerState();
+
+        res.json({
+          ok: true,
+          engine: "server-admin",
+          ...result,
+        });
+      } catch (error) {
+        res.status(500).json({
+          ok: false,
+          error: friendlyErrorMessage(error, "Serveren kunne ikke nullstilles."),
+        });
+      }
+
+      return;
+    }
+
+    res.status(400).json({
+      ok: false,
+      error: "Ukjent serverkommando.",
+    });
+    return;
+  }
 
   if (command === "describe") {
     if (!requestedUrl) {
