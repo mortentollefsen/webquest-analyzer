@@ -6466,13 +6466,6 @@ async function getSummary(page, url, options = {}) {
     messageCount: 0,
     messages: [],
   }, 12000);
-  const brokenLinks = {
-    linksTotal: 0,
-    checked: [],
-    skipped: [],
-    broken: [],
-    error: "Ikke kjørt i Oppsummering. Bruk Brutte lenker for full lenkesjekk.",
-  };
   const allFields = flatFields(fields);
   const h1Count = headings.filter((heading) => heading.level === 1).length;
   const fieldMissingNames = allFields.filter((field) => !field.name).length;
@@ -6488,7 +6481,6 @@ async function getSummary(page, url, options = {}) {
   const wcagNodes = countWcagNodes(wcag);
   const contrastFailures = (contrast.aaFailures || []).length;
   const htmlErrors = Number(html.errorCount) || 0;
-  const brokenCount = (brokenLinks.broken || []).length;
   const landmarkIssues = (landmarks.issues || []).length + (landmarks.outsideItems || []).length;
   const priorities = [];
 
@@ -6503,8 +6495,8 @@ async function getSummary(page, url, options = {}) {
   addPriority(imagesMissingAccessibleName > 0 || imagesMissingAlt > 0, `${imagesMissingAccessibleName} bilder mangler accessible name, ${imagesMissingAlt} mangler alt-attributt.`, "Bilder");
   addPriority(contrastFailures > 0, `${contrastFailures} tekstforekomster feiler AA-kontrast.`, "Kontrast");
   addPriority(htmlErrors > 0, `${htmlErrors} HTML-feil funnet.`, "HTML");
-  addPriority(brokenCount > 0, `${brokenCount} brutte lenker funnet på siden.`, "Brutte lenker");
   addPriority((links.issues || []).length > 0 || linkMissingNames > 0, `${(links.issues || []).length} mulige lenkeproblemer, ${linkMissingNames} lenker uten navn.`, "Lenker");
+  addPriority((links.links || []).length > 0, "Sjekk om siden har brutte lenker.", "Brutte lenker");
   addPriority(landmarkIssues > 0, `${landmarkIssues} mulige landemerkeproblemer eller innhold utenfor landemerker.`, "Landemerker");
   addPriority((aria.issues || []).length > 0, `${(aria.issues || []).length} mulige ARIA-problemer.`, "Aria");
   addPriority(allFields.length + (links.links || []).length > 10, "Siden har mange interaktive elementer. Sjekk tab-rekkefølge og tastaturbruk.", "Tastatur");
@@ -6548,8 +6540,7 @@ async function getSummary(page, url, options = {}) {
       imagesMissingAlt,
       landmarks: landmarkIssues,
       aria: (aria.issues || []).length,
-      brokenLinks: brokenCount,
-      brokenLinksError: brokenLinks.error || "",
+      brokenLinksChecked: false,
       hiddenCookieBanners,
     },
     priorities,
