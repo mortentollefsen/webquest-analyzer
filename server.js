@@ -478,6 +478,7 @@ function httpStatusText(status, statusText = "") {
 
 function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden.") {
   const message = String(error?.message || error || "");
+  const name = String(error?.name || "");
 
   if (/URL-en/i.test(message)) {
     return message;
@@ -487,7 +488,7 @@ function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden."
     return "URL-en kan ikke nås. Domenet finnes ikke, eller DNS-oppslag feilet.";
   }
 
-  if (/ETIMEDOUT|timed out|Timeout|ERR_CONNECTION_TIMED_OUT/i.test(message)) {
+  if (/AbortError/i.test(name) || /ETIMEDOUT|timed out|Timeout|ERR_CONNECTION_TIMED_OUT|aborted/i.test(message)) {
     return "URL-en kan ikke nås. Siden svarte ikke innen tidsfristen.";
   }
 
@@ -510,14 +511,21 @@ function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden."
   return fallback;
 }
 
+function isTimeoutError(error) {
+  const name = String(error?.name || "");
+  const message = String(error?.message || error || "");
+
+  return /AbortError/i.test(name) || /ETIMEDOUT|timed out|Timeout|ERR_CONNECTION_TIMED_OUT|aborted/i.test(message);
+}
+
 async function checkReachableUrl(url) {
   const validatedUrl = await validatePublicUrl(url);
   let lastError = null;
 
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
-    const method = attempt < 3 ? "HEAD" : "GET";
+    const method = attempt === 1 ? "HEAD" : "GET";
 
     try {
       let response = await fetch(validatedUrl, {
@@ -540,7 +548,7 @@ async function checkReachableUrl(url) {
         });
       }
 
-      if (response.status >= 500 && attempt < 3) {
+      if (response.status >= 500 && attempt < 2) {
         await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
         continue;
       }
@@ -583,7 +591,15 @@ async function checkReachableUrl(url) {
     } catch (error) {
       lastError = error;
 
-      if (attempt < 3) {
+      if (isTimeoutError(error) && attempt >= 2) {
+        return {
+          ok: true,
+          url: validatedUrl,
+          warning: "URL-en er valgt, men WebQuest-serveren fikk ikke svar innen tidsfristen. Siden kan fungere i vanlig nettleser, men automatiske analyser kan feile eller bruke lang tid.",
+        };
+      }
+
+      if (attempt < 2) {
         await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
       }
     } finally {
