@@ -43,6 +43,16 @@ const serverMessageTtlMs = Math.max(60000, Number(process.env.WEBQUEST_SERVER_ME
 let serverMessage = null;
 const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
+const browserLikeUserAgent =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+function browserLikeHeaders(extra = {}) {
+  return {
+    "User-Agent": browserLikeUserAgent,
+    "Accept-Language": "nb-NO,nb;q=0.9,no;q=0.8,en-US;q=0.7,en;q=0.6",
+    ...extra,
+  };
+}
 
 function shouldIgnoreHttpStatus(status, options = {}) {
   return (options.ignore401 && status === 401) || (options.ignore403 && status === 403);
@@ -58,8 +68,7 @@ function browserContextOptions(extra = {}) {
     locale: "nb-NO",
     serviceWorkers: "block",
     viewport: { ...defaultViewport },
-    userAgent:
-      "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+    userAgent: browserLikeUserAgent,
     ...extra,
   };
 }
@@ -515,19 +524,19 @@ async function checkReachableUrl(url) {
         method,
         redirect: "follow",
         signal: controller.signal,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-        },
+        headers: browserLikeHeaders({
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        }),
       });
 
-      if ([405, 501].includes(response.status) && method === "HEAD") {
+      if ([403, 405, 501].includes(response.status) && method === "HEAD") {
         response = await fetch(validatedUrl, {
           method: "GET",
           redirect: "follow",
           signal: controller.signal,
-          headers: {
-            "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-          },
+          headers: browserLikeHeaders({
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+          }),
         });
       }
 
@@ -3212,6 +3221,9 @@ async function getBrokenLinks(page, pageUrl, options = {}) {
         method: "HEAD",
         redirect: "follow",
         signal: controller.signal,
+        headers: browserLikeHeaders({
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }),
       });
 
       if (response.status === 405 || response.status === 403) {
@@ -3219,6 +3231,9 @@ async function getBrokenLinks(page, pageUrl, options = {}) {
           method: "GET",
           redirect: "follow",
           signal: controller.signal,
+          headers: browserLikeHeaders({
+            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          }),
         });
       }
 
@@ -4844,11 +4859,10 @@ async function fetchCssForRuleSearch(startUrl, referer = "") {
       const response = await fetch(validatedUrl, {
         redirect: "manual",
         signal: controller.signal,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
+        headers: browserLikeHeaders({
           "Accept": "text/css,*/*;q=0.1",
           ...(referer ? { Referer: referer } : {}),
-        },
+        }),
       });
 
       if (response.status >= 300 && response.status < 400) {
@@ -6552,9 +6566,9 @@ async function getSource(url) {
   const response = await fetch(url, {
     method: "GET",
     redirect: "follow",
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-    },
+    headers: browserLikeHeaders({
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }),
   });
 
   if (!response.ok) {
@@ -6579,9 +6593,9 @@ async function getRobotsInfo(pageUrl) {
       method: "GET",
       redirect: "follow",
       signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-      },
+      headers: browserLikeHeaders({
+        Accept: "text/plain,text/html;q=0.9,*/*;q=0.8",
+      }),
     });
     const text = await response.text();
     const contentType = response.headers.get("content-type") || "";
@@ -7214,9 +7228,9 @@ async function checkCrawlHttpLink(link, options = {}) {
       method: "HEAD",
       redirect: "follow",
       signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-      },
+      headers: browserLikeHeaders({
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      }),
     });
 
     if ([403, 405, 501].includes(response.status)) {
@@ -7224,9 +7238,9 @@ async function checkCrawlHttpLink(link, options = {}) {
         method: "GET",
         redirect: "follow",
         signal: controller.signal,
-        headers: {
-          "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-        },
+        headers: browserLikeHeaders({
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }),
       });
     }
 
@@ -7333,10 +7347,9 @@ async function fetchHtmlForCrawl(url, options = {}) {
       method: "GET",
       redirect: "follow",
       signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; WebQuest/1.0; +https://mortentollefsen.no/apper/webquest/)",
-        "Accept": "text/html,application/xhtml+xml",
-      },
+      headers: browserLikeHeaders({
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      }),
     });
     const contentType = response.headers.get("content-type") || "";
 
