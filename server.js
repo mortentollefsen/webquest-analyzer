@@ -545,6 +545,25 @@ async function checkReachableUrl(url) {
         continue;
       }
 
+      if (response.status === 403) {
+        const browserResult = await checkReachableUrlWithBrowser(validatedUrl).catch((error) => ({
+          ok: false,
+          error: error.message,
+        }));
+
+        if (browserResult.ok) {
+          return browserResult;
+        }
+
+        return {
+          ok: true,
+          url: response.url || validatedUrl,
+          status: response.status,
+          statusText: response.statusText,
+          warning: "URL-en er valgt, men WebQuest-serveren fikk 403 Forbidden. Siden finnes sannsynligvis, men kan blokkere automatiske analyser.",
+        };
+      }
+
       if (response.status >= 400) {
         return {
           ok: false,
@@ -577,6 +596,46 @@ async function checkReachableUrl(url) {
     url: validatedUrl,
     error: friendlyErrorMessage(lastError, "URL-en kan ikke nås."),
   };
+}
+
+async function checkReachableUrlWithBrowser(url) {
+  const browser = await getBrowser();
+  const context = await browser.newContext(browserContextOptions());
+  let page;
+
+  try {
+    page = await context.newPage();
+    const response = await page.goto(url, {
+      waitUntil: "domcontentloaded",
+      timeout: 20000,
+    });
+    const status = response?.status() || 0;
+    const finalUrl = page.url() || response?.url() || url;
+
+    if (status >= 400) {
+      return {
+        ok: false,
+        url: finalUrl,
+        status,
+        statusText: response?.statusText?.() || "",
+        error: `URL-en kan ikke nås. Serveren svarte ${httpStatusText(status, response?.statusText?.() || "")}.`,
+      };
+    }
+
+    return {
+      ok: true,
+      url: finalUrl,
+      status: status || 200,
+      statusText: response?.statusText?.() || "OK",
+      engine: "browser",
+    };
+  } finally {
+    if (page) {
+      await page.close().catch(() => {});
+    }
+
+    await context.close().catch(() => {});
+  }
 }
 
 function setCorsHeaders(req, res) {
