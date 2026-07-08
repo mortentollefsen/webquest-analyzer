@@ -231,18 +231,23 @@ function getPublicServerMessage(sinceId = 0) {
   return {
     id: serverMessage.id,
     text: serverMessage.text,
+    type: serverMessage.type || "kort",
+    format: serverMessage.format || "text",
     createdAt: serverMessage.createdAtIso,
     expiresAt: serverMessage.expiresAtIso,
   };
 }
 
-function setServerMessage(text) {
+function setServerMessage(text, options = {}) {
   const now = Date.now();
-  const expiresAt = now + serverMessageTtlMs;
+  const requestedExpiresAt = Number(options.expiresAt) || 0;
+  const expiresAt = requestedExpiresAt > now ? requestedExpiresAt : now + serverMessageTtlMs;
 
   serverMessage = {
     id: now,
-    text: String(text || "").trim().slice(0, 2000),
+    text: String(text || "").trim().slice(0, options.format === "html" ? 12000 : 2000),
+    type: options.type || (requestedExpiresAt ? "tidsstyrt" : "kort"),
+    format: options.format === "html" ? "html" : "text",
     createdAt: now,
     expiresAt,
     createdAtIso: new Date(now).toISOString(),
@@ -250,6 +255,12 @@ function setServerMessage(text) {
   };
 
   return getPublicServerMessage(0);
+}
+
+function clearServerMessage() {
+  const hadMessage = Boolean(serverMessage);
+  serverMessage = null;
+  return hadMessage;
 }
 
 function getServerStatus() {
@@ -267,6 +278,10 @@ function getServerStatus() {
     browserUseCount,
     rssMb: currentRssMb(),
     serverMessageActive: Boolean(serverMessage),
+    serverMessageText: serverMessage?.text || "",
+    serverMessageType: serverMessage?.type || "",
+    serverMessageFormat: serverMessage?.format || "",
+    serverMessageCreatedAt: serverMessage?.createdAtIso || "",
     serverMessageExpiresAt: serverMessage?.expiresAtIso || "",
     limits: {
       maxConcurrentAnalyses,
@@ -9018,6 +9033,7 @@ app.get("/analyze", async (req, res) => {
 
     if (action === "melding") {
       const text = String(req.query.text || "").trim();
+      const format = String(req.query.format || "text").trim().toLowerCase();
 
       if (!text) {
         res.status(400).json({
@@ -9030,7 +9046,60 @@ app.get("/analyze", async (req, res) => {
       res.json({
         ok: true,
         engine: "server-admin",
-        message: setServerMessage(text),
+        message: setServerMessage(text, { format }),
+        server: getServerStatus(),
+      });
+      return;
+    }
+
+    if (action === "melding-til") {
+      const text = String(req.query.text || "").trim();
+      const format = String(req.query.format || "text").trim().toLowerCase();
+      const expiresAt = Date.parse(String(req.query.expiresAt || ""));
+
+      if (!text) {
+        res.status(400).json({
+          ok: false,
+          error: "Skriv en melding etter server -melding-til dato klokkeslett.",
+        });
+        return;
+      }
+
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        res.status(400).json({
+          ok: false,
+          error: "Utløpstidspunktet må være en gyldig dato og tid fram i tid.",
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        engine: "server-admin",
+        message: setServerMessage(text, { expiresAt, type: "tidsstyrt", format }),
+        server: getServerStatus(),
+      });
+      return;
+    }
+
+    if (action === "melding-status") {
+      res.json({
+        ok: true,
+        engine: "server-admin",
+        message: getPublicServerMessage(0),
+        server: getServerStatus(),
+      });
+      return;
+    }
+
+    if (action === "melding-slett") {
+      const removed = clearServerMessage();
+
+      res.json({
+        ok: true,
+        engine: "server-admin",
+        removed,
+        message: null,
         server: getServerStatus(),
       });
       return;
