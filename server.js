@@ -6,6 +6,10 @@ import crypto from "node:crypto";
 import axe from "axe-core";
 import { HtmlValidate } from "html-validate";
 import * as csstree from "css-tree";
+import nspell from "nspell";
+import dictionaryNb from "dictionary-nb";
+import dictionaryNn from "dictionary-nn";
+import dictionaryEn from "dictionary-en";
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -45,6 +49,12 @@ const defaultViewport = Object.freeze({ width: 1280, height: 720 });
 const crcTable = createCrcTable();
 const browserLikeUserAgent =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+const spellCheckerCache = new Map();
+const spellDictionaries = new Map([
+  ["nb", dictionaryNb],
+  ["nn", dictionaryNn],
+  ["en", dictionaryEn],
+]);
 
 function browserLikeHeaders(extra = {}) {
   return {
@@ -56,6 +66,75 @@ function browserLikeHeaders(extra = {}) {
 
 function shouldIgnoreHttpStatus(status, options = {}) {
   return (options.ignore401 && status === 401) || (options.ignore403 && status === 403);
+}
+
+function normalizeSpellLanguage(value) {
+  const language = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace("_", "-");
+
+  if (!language) {
+    return "";
+  }
+
+  if (language === "no" || language === "nb" || language.startsWith("nb-") || language.startsWith("no-")) {
+    return "nb";
+  }
+
+  if (language === "nn" || language.startsWith("nn-")) {
+    return "nn";
+  }
+
+  if (language === "en" || language.startsWith("en-")) {
+    return "en";
+  }
+
+  return language.split("-")[0] || language;
+}
+
+function getSpellChecker(language) {
+  const normalized = normalizeSpellLanguage(language);
+
+  if (!spellDictionaries.has(normalized)) {
+    return null;
+  }
+
+  if (!spellCheckerCache.has(normalized)) {
+    spellCheckerCache.set(normalized, nspell(spellDictionaries.get(normalized)));
+  }
+
+  return spellCheckerCache.get(normalized);
+}
+
+function tokenizeSpellWords(text) {
+  const matches = String(text || "").match(/[\p{L}][\p{L}\p{M}'’.-]*/gu) || [];
+
+  return matches
+    .map((word) => word.replace(/^[.'’-]+|[.'’-]+$/g, ""))
+    .filter((word) => {
+      if (word.length < 2) return false;
+      if (/^\p{Lu}+$/u.test(word) && word.length <= 5) return false;
+      if (/https?:|www\.|@/i.test(word)) return false;
+      if (/\d/.test(word)) return false;
+      return true;
+    });
+}
+
+function contextForMisspelling(text, word) {
+  const normalizedText = String(text || "").replace(/\s+/g, " ").trim();
+  const index = normalizedText.toLowerCase().indexOf(String(word || "").toLowerCase());
+
+  if (index === -1) {
+    return normalizedText.slice(0, 160);
+  }
+
+  const start = Math.max(0, index - 70);
+  const end = Math.min(normalizedText.length, index + word.length + 70);
+  const prefix = start > 0 ? "..." : "";
+  const suffix = end < normalizedText.length ? "..." : "";
+
+  return `${prefix}${normalizedText.slice(start, end)}${suffix}`;
 }
 
 const htmlValidator = new HtmlValidate({
@@ -3969,6 +4048,207 @@ async function getReadability(page) {
       issues,
     };
   });
+}
+
+async function getSpellcheck(page, options = {}) {
+  const requestedLanguage = normalizeSpellLanguage(options.language);
+  const data = await page.evaluate((selectorValue) => {
+    function normalized(text) {
+      return String(text || "").replace(/\s+/g, " ").trim();
+    }
+
+    function isHidden(element) {
+      for (let node = element; node; node = node.parentElement) {
+        const style = window.getComputedStyle(node);
+
+        if (
+          node.hasAttribute("hidden") ||
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          style.visibility === "collapse" ||
+          node.getAttribute("aria-hidden") === "true"
+        ) {
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    function selectorFor(element) {
+      if (!element || !element.tagName) {
+        return "";
+      }
+
+      if (element.id) {
+        return `#${CSS.escape(element.id)}`;
+      }
+
+      const parts = [];
+
+      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
+        const tag = node.tagName.toLowerCase();
+        const parent = node.parentElement;
+
+        if (!parent) {
+          parts.unshift(tag);
+          break;
+        }
+
+        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
+        const index = sameTag.indexOf(node) + 1;
+        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
+      }
+
+      return parts.join(" > ");
+    }
+
+    const selector = String(selectorValue || "").trim();
+    let root = document.body;
+
+    if (selector) {
+      try {
+        root = document.querySelector(selector);
+      } catch {
+        return {
+          error: "Ugyldig selector.",
+          selector,
+          language: document.documentElement.getAttribute("lang") || "",
+          textItems: [],
+        };
+      }
+
+      if (!root) {
+        return {
+          error: "Ingen elementer traff selector.",
+          selector,
+          language: document.documentElement.getAttribute("lang") || "",
+          textItems: [],
+        };
+      }
+    }
+
+    const textItems = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        const parent = node.parentElement;
+
+        if (!parent || isHidden(parent) || parent.closest("script,style,noscript,template,code,pre,kbd,samp,svg,canvas")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+
+        const text = normalized(node.nodeValue || "");
+
+        if (text.length < 2 || !/[\p{L}]/u.test(text)) {
+          return NodeFilter.FILTER_REJECT;
+        }
+
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+
+    while (textItems.length < 800) {
+      const node = walker.nextNode();
+
+      if (!node) {
+        break;
+      }
+
+      textItems.push({
+        text: normalized(node.nodeValue || ""),
+        selector: selectorFor(node.parentElement),
+        lang: node.parentElement?.closest("[lang]")?.getAttribute("lang") || "",
+      });
+    }
+
+    return {
+      selector,
+      language: document.documentElement.getAttribute("lang") || "",
+      textItems,
+      truncatedTextNodes: Boolean(walker.nextNode()),
+    };
+  }, options.selector || "");
+
+  const pageLanguage = normalizeSpellLanguage(data.language);
+  const language = requestedLanguage || pageLanguage;
+  const checker = getSpellChecker(language);
+  const base = {
+    selector: data.selector || "",
+    language,
+    requestedLanguage,
+    pageLanguage,
+    supported: Boolean(checker),
+    supportedLanguages: Array.from(spellDictionaries.keys()),
+    textNodes: (data.textItems || []).length,
+    misspellings: [],
+    checkedWords: 0,
+    uniqueWords: 0,
+    truncatedTextNodes: Boolean(data.truncatedTextNodes),
+    truncatedMisspellings: false,
+  };
+
+  if (data.error) {
+    return {
+      ...base,
+      error: data.error,
+    };
+  }
+
+  if (!checker) {
+    return base;
+  }
+
+  const ignored = {
+    repeated: 0,
+    accepted: 0,
+  };
+  const seenWords = new Set();
+  const misspellings = [];
+  let checkedWords = 0;
+
+  for (const item of data.textItems || []) {
+    for (const word of tokenizeSpellWords(item.text)) {
+      const key = word.toLocaleLowerCase("nb-NO");
+
+      if (seenWords.has(key)) {
+        ignored.repeated += 1;
+        continue;
+      }
+
+      seenWords.add(key);
+      checkedWords += 1;
+
+      if (checker.correct(word)) {
+        ignored.accepted += 1;
+        continue;
+      }
+
+      misspellings.push({
+        word,
+        suggestions: checker.suggest(word).slice(0, 5),
+        selector: item.selector,
+        lang: item.lang || data.language || "",
+        context: contextForMisspelling(item.text, word),
+      });
+
+      if (misspellings.length >= 200) {
+        break;
+      }
+    }
+
+    if (misspellings.length >= 200) {
+      break;
+    }
+  }
+
+  return {
+    ...base,
+    checkedWords,
+    uniqueWords: seenWords.size,
+    ignored,
+    misspellings,
+    truncatedMisspellings: misspellings.length >= 200,
+  };
 }
 
 async function getFocus(page) {
@@ -8791,6 +9071,15 @@ const analyzers = {
     url,
     readability: await getReadability(page),
   }),
+  spellcheck: async (page, url, options = {}) => ({
+    ok: true,
+    engine: "playwright+nspell",
+    url,
+    spellcheck: await getSpellcheck(page, {
+      selector: options.selector || "",
+      language: options.language || "",
+    }),
+  }),
   focus: async (page, url) => ({
     ok: true,
     engine: "playwright",
@@ -8980,6 +9269,7 @@ app.get("/analyze", async (req, res) => {
   const command = String(req.query.command || "").toLowerCase();
   const requestedUrl = normalizeUrl(req.query.url);
   const selector = String(req.query.selector || "").trim();
+  const language = String(req.query.language || req.query.lang || "").trim();
   const ignore401 = String(req.query.ignore401 || "") === "1";
   const ignore403 = String(req.query.ignore403 || "") === "1";
   const cookieChoice = String(req.query.cookieChoice || "").trim();
@@ -9394,7 +9684,7 @@ app.get("/analyze", async (req, res) => {
 
     const result = await analyzePage(
       url,
-      (page) => analyzers[command](page, url, { selector, ignore401, ignore403 }),
+      (page) => analyzers[command](page, url, { selector, language, ignore401, ignore403 }),
       { cookieChoice, cookieFlow, viewport, clientWindowId, forceFreshContext: command === "cookies" }
     );
 
