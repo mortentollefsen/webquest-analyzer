@@ -4171,15 +4171,18 @@ async function getSpellcheck(page, options = {}) {
 
   const pageLanguage = normalizeSpellLanguage(data.language);
   const language = requestedLanguage || pageLanguage;
-  const checker = getSpellChecker(language);
   const base = {
     selector: data.selector || "",
-    language,
+    language: requestedLanguage || "automatisk",
     requestedLanguage,
     pageLanguage,
-    supported: Boolean(checker),
+    supported: false,
     supportedLanguages: Array.from(spellDictionaries.keys()),
     textNodes: (data.textItems || []).length,
+    supportedTextNodes: 0,
+    unsupportedTextNodes: 0,
+    languagesUsed: [],
+    unsupportedLanguages: [],
     misspellings: [],
     checkedWords: 0,
     uniqueWords: 0,
@@ -4194,21 +4197,57 @@ async function getSpellcheck(page, options = {}) {
     };
   }
 
-  if (!checker) {
+  if (requestedLanguage && !getSpellChecker(requestedLanguage)) {
     return base;
   }
 
   const ignored = {
     repeated: 0,
     accepted: 0,
+    unsupportedLanguage: 0,
   };
   const seenWords = new Set();
   const misspellings = [];
+  const languagesUsed = new Set();
+  const unsupportedLanguages = new Set();
+  const languageStats = new Map();
   let checkedWords = 0;
+  let supportedTextNodes = 0;
+  let unsupportedTextNodes = 0;
+
+  function addLanguageStat(languageCode, field) {
+    const current = languageStats.get(languageCode) || {
+      language: languageCode,
+      textNodes: 0,
+      checkedWords: 0,
+      misspellings: 0,
+    };
+
+    current[field] += 1;
+    languageStats.set(languageCode, current);
+  }
 
   for (const item of data.textItems || []) {
+    const itemLanguage = requestedLanguage || normalizeSpellLanguage(item.lang) || pageLanguage;
+    const checker = getSpellChecker(itemLanguage);
+
+    if (!checker) {
+      unsupportedTextNodes += 1;
+      ignored.unsupportedLanguage += 1;
+
+      if (itemLanguage) {
+        unsupportedLanguages.add(itemLanguage);
+      }
+
+      continue;
+    }
+
+    supportedTextNodes += 1;
+    languagesUsed.add(itemLanguage);
+    addLanguageStat(itemLanguage, "textNodes");
+
     for (const word of tokenizeSpellWords(item.text)) {
-      const key = word.toLocaleLowerCase("nb-NO");
+      const key = `${itemLanguage}:${word.toLocaleLowerCase("nb-NO")}`;
 
       if (seenWords.has(key)) {
         ignored.repeated += 1;
@@ -4217,6 +4256,7 @@ async function getSpellcheck(page, options = {}) {
 
       seenWords.add(key);
       checkedWords += 1;
+      addLanguageStat(itemLanguage, "checkedWords");
 
       if (checker.correct(word)) {
         ignored.accepted += 1;
@@ -4227,9 +4267,11 @@ async function getSpellcheck(page, options = {}) {
         word,
         suggestions: checker.suggest(word).slice(0, 5),
         selector: item.selector,
-        lang: item.lang || data.language || "",
+        lang: itemLanguage,
+        originalLang: item.lang || data.language || "",
         context: contextForMisspelling(item.text, word),
       });
+      addLanguageStat(itemLanguage, "misspellings");
 
       if (misspellings.length >= 200) {
         break;
@@ -4243,6 +4285,12 @@ async function getSpellcheck(page, options = {}) {
 
   return {
     ...base,
+    supported: supportedTextNodes > 0,
+    supportedTextNodes,
+    unsupportedTextNodes,
+    languagesUsed: Array.from(languagesUsed),
+    unsupportedLanguages: Array.from(unsupportedLanguages),
+    languageStats: Array.from(languageStats.values()),
     checkedWords,
     uniqueWords: seenWords.size,
     ignored,
