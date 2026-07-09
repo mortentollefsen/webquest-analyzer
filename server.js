@@ -263,17 +263,35 @@ function currentRssMb() {
   return Math.round(process.memoryUsage().rss / 1024 / 1024);
 }
 
+async function withTimeout(promise, timeoutMs, label) {
+  let timeoutId;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => {
+          resolve({ timedOut: true, label });
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function closeSharedBrowser(reason = "") {
   if (!browserPromise) {
     return;
   }
 
-  const browser = await browserPromise.catch(() => null);
+  const browserResult = await withTimeout(browserPromise.catch(() => null), 5000, "browserPromise");
+  const browser = browserResult?.timedOut ? null : browserResult;
   browserPromise = null;
   browserUseCount = 0;
 
   if (browser) {
-    await browser.close().catch(() => {});
+    await withTimeout(browser.close().catch(() => {}), 5000, "browser.close");
   }
 
   if (reason) {
@@ -357,7 +375,7 @@ function getServerStatus() {
     browserUseCount,
     rssMb: currentRssMb(),
     serverMessageActive: Boolean(serverMessage),
-    serverMessageText: serverMessage?.text || "",
+    serverMessageLength: serverMessage?.text ? serverMessage.text.length : 0,
     serverMessageType: serverMessage?.type || "",
     serverMessageFormat: serverMessage?.format || "",
     serverMessageCreatedAt: serverMessage?.createdAtIso || "",
@@ -831,7 +849,7 @@ async function closeInteractiveSession(session) {
     return;
   }
 
-  await session.context?.close().catch(() => {});
+  await withTimeout(session.context?.close().catch(() => {}), 5000, "interactive context close");
 }
 
 async function cleanupInteractiveSessions(force = false) {
@@ -1783,8 +1801,11 @@ async function resetPersistentContext() {
   }
 
   try {
-    const context = await persistentContextPromise;
-    await context.close();
+    const contextResult = await withTimeout(persistentContextPromise, 5000, "persistentContextPromise");
+
+    if (!contextResult?.timedOut) {
+      await withTimeout(contextResult.close(), 5000, "persistent context close");
+    }
   } catch {
   } finally {
     persistentContextPromise = null;
