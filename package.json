@@ -12,6 +12,7 @@
     "dictionary-en": "^4.0.0",
     "dictionary-nb": "^3.0.0",
     "dictionary-nn": "^3.0.0",
+    "dom-accessibility-api": "^0.7.1",
     "express": "^4.19.2",
     "html-validate": "^11.5.3",
     "nspell": "^2.1.5",
@@ -19,5 +20,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12"
   }
 }

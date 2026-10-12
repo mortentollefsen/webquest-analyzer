@@ -1,4 +1,6 @@
 import express from "express";
+import { readFileSync } from "node:fs";
+const collectHeadingReport = new Function(readFileSync(new URL("./src/heading-analysis.js", import.meta.url), "utf8") + "\nreturn webquestHeadingAnalysis.headingsReport();");
 import { screenReaderReport } from "./src/screen-reader.mjs";
 import { chromium } from "playwright";
 import dns from "node:dns/promises";
@@ -1938,56 +1940,8 @@ async function describeImage(url) {
 }
 
 async function getHeadings(page) {
-  await page.waitForSelector("h1, h2, h3, h4, h5, h6", { timeout: 10000 }).catch(() => {});
-
-  return page.locator("h1, h2, h3, h4, h5, h6").evaluateAll((headings) =>
-    headings
-      .map((heading) => {
-        function hasHiddenAncestor(element) {
-          for (let node = element; node; node = node.parentElement) {
-            const style = window.getComputedStyle(node);
-
-            if (
-              node.hasAttribute("hidden") ||
-              node.getAttribute("type") === "hidden" ||
-              style.display === "none" ||
-              style.visibility === "hidden" ||
-              style.visibility === "collapse" ||
-              style.contentVisibility === "hidden"
-            ) {
-              return true;
-            }
-          }
-
-          return false;
-        }
-
-        function hasAriaHiddenAncestor(element) {
-          for (let node = element; node; node = node.parentElement) {
-            if (node.getAttribute("aria-hidden") === "true") {
-              return true;
-            }
-          }
-
-          return false;
-        }
-
-        if (hasHiddenAncestor(heading)) {
-          return null;
-        }
-
-        return {
-          level: Number(heading.tagName.slice(1)),
-          text:
-            heading.getAttribute("aria-label") ||
-            heading.innerText.replace(/\s+/g, " ").trim() ||
-            heading.textContent.replace(/\s+/g, " ").trim() ||
-            "(tom overskrift)",
-          ariaHidden: hasAriaHiddenAncestor(heading),
-        };
-      })
-      .filter(Boolean)
-  );
+  await page.waitForSelector("h1, h2, h3, h4, h5, h6", { state: "attached", timeout: 10000 }).catch(() => {});
+  return page.evaluate(collectHeadingReport);
 }
 
 async function getLanguage(page) {
@@ -6271,6 +6225,7 @@ async function getDesignAnalysis(page, url) {
   const screenshots = await getScreenshots(page, url);
   const responsive = await getCssResponsive(page, url);
   const focusStyles = await getCssFocusStyles(page);
+  const h1Headings = (await getHeadings(page)).filter((heading) => heading.level === 1);
   const metrics = await page.evaluate(() => {
     function normalized(text) {
       return String(text || "").replace(/\s+/g, " ").trim();
@@ -6333,12 +6288,10 @@ async function getDesignAnalysis(page, url) {
         selector: selectorFor(element),
       }))
       .slice(0, 20);
-    const h1 = document.querySelector("h1");
     const bodyStyle = window.getComputedStyle(document.body);
 
     return {
       title: document.title || "",
-      h1: h1 ? normalized(h1.innerText || h1.textContent) : "",
       bodyFont: bodyStyle.fontFamily,
       bodyColor: bodyStyle.color,
       bodyBackground: bodyStyle.backgroundColor,
@@ -6358,6 +6311,9 @@ async function getDesignAnalysis(page, url) {
 
   return {
     ...metrics,
+    h1: h1Headings[0]?.text || "",
+    h1Count: h1Headings.length,
+    h1NameSource: h1Headings[0]?.nameSource || "ingen",
     screenshots,
     responsive,
     focusStylesSummary: {
@@ -6967,7 +6923,7 @@ async function getSummary(page, url, options = {}) {
     headings: {
       total: headings.length,
       h1: h1Count,
-      empty: headings.filter((heading) => heading.text === "(tom overskrift)").length,
+      empty: headings.filter((heading) => !heading.name).length,
     },
     counts: {
       landmarks: (landmarks.landmarks || []).length,
