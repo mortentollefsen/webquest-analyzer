@@ -1,4 +1,5 @@
 import express from "express";
+import { retryHttpLinkWithGet, classifyHttpLinkResponse } from "./src/link-status.mjs";
 import { readFileSync } from "node:fs";
 const collectHeadingReport = new Function(readFileSync(new URL("./src/heading-analysis.js", import.meta.url), "utf8") + "\nreturn webquestHeadingAnalysis.headingsReport();");
 import { screenReaderReport } from "./src/screen-reader.mjs";
@@ -3383,20 +3384,17 @@ async function checkHttpLinkStatus(link, options = {}, timeoutMs = 10000) {
     let response = await request("HEAD");
     let method = "HEAD";
     await response.body?.cancel().catch(() => {});
-    if ([400, 403, 405, 501].includes(response.status)) {
+    if (retryHttpLinkWithGet(response.status)) {
       response = await request("GET");
       method = "GET";
       await response.body?.cancel().catch(() => {});
     }
-    const reason = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
     return {
       ...link, status: response.status, statusText: response.statusText || "", method,
       finalUrl: response.url || link.href,
-      ignored: shouldIgnoreHttpStatus(response.status, options),
-      uncertain: response.status === 400,
-      reason: response.status === 400
-        ? `${reason}. Serveren avviste den automatiske forespørselen. Dette bekrefter ikke at lenken er brutt; kontroller den i nettleseren.`
-        : reason,
+      ...classifyHttpLinkResponse(response.status, response.statusText, [
+        ...(options.ignore401 ? [401] : []), ...(options.ignore403 ? [403] : []),
+      ]),
     };
   } catch (error) {
     if (options.job?.cancelled) return null;
