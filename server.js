@@ -647,7 +647,7 @@ async function checkReachableUrl(url) {
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
+    const timeout = setTimeout(() => controller.abort(), 6000);
     const method = attempt === 1 ? "HEAD" : "GET";
 
     try {
@@ -717,17 +717,8 @@ async function checkReachableUrl(url) {
     } catch (error) {
       lastError = error;
 
-      if (isTimeoutError(error) && attempt >= 2) {
-        return {
-          ok: true,
-          url: validatedUrl,
-          warning: "URL-en er valgt, men WebQuest-serveren fikk ikke svar innen tidsfristen. Siden kan fungere i vanlig nettleser, men automatiske analyser kan feile eller bruke lang tid.",
-        };
-      }
-
-      if (attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
-      }
+      // Repeating the same failed transport delays the browser fallback and the queue.
+      break;
     } finally {
       clearTimeout(timeout);
     }
@@ -738,6 +729,13 @@ async function checkReachableUrl(url) {
   try {
     return await checkReachableUrlWithBrowser(validatedUrl);
   } catch (error) {
+    if (isTimeoutError(error)) {
+      return {
+        ok: true,
+        url: validatedUrl,
+        warning: "Adressen er valgt, men WebQuest-serveren fikk tidsavbrudd og har ikke bekreftet at siden kan analyseres. Siden kan fungere i nettleseren din. Nettstedet kan være tregt eller begrense forbindelser fra Render.",
+      };
+    }
     const browserMessage = friendlyErrorMessage(error, "");
     return {
       ok: false,
@@ -757,7 +755,7 @@ async function checkReachableUrlWithBrowser(url) {
     page = await context.newPage();
     const response = await page.goto(url, {
       waitUntil: "commit",
-      timeout: 20000,
+      timeout: 10000,
     });
     const status = response?.status() || 0;
     const finalUrl = page.url() || response?.url() || url;
@@ -1754,9 +1752,30 @@ async function getPageInfo(page) {
   }));
 }
 
+async function waitForAnalysisDom(page) {
+  await page.evaluate(() => new Promise((resolve) => {
+    const started = Date.now();
+    let changed = started;
+    const observer = new MutationObserver(() => { changed = Date.now(); });
+    observer.observe(document.documentElement, {
+      subtree: true, childList: true, characterData: true,
+      attributes: true, attributeFilter: ["class", "style", "hidden", "aria-hidden", "aria-label", "aria-labelledby", "alt"],
+    });
+    const timer = setInterval(() => {
+      const now = Date.now();
+      if (now - started >= 3000 || (now - started >= 1200 && now - changed >= 700)) {
+        clearInterval(timer);
+        observer.disconnect();
+        resolve();
+      }
+    }, 100);
+  }));
+}
+
 async function gotoForAnalysis(page, url, timeout) {
+  const deadline = Date.now() + timeout;
   const response = await page.goto(url, {
-    waitUntil: "domcontentloaded",
+    waitUntil: "commit",
     timeout,
   });
 
@@ -1764,8 +1783,9 @@ async function gotoForAnalysis(page, url, timeout) {
     throw new Error(`URL-en kan ikke nås. Serveren svarte ${httpStatusText(response.status(), response.statusText())}.`);
   }
 
-  await page.waitForLoadState("load", { timeout: Math.min(timeout, 15000) }).catch(() => {});
-  await page.waitForTimeout(1200);
+  await page.waitForLoadState("domcontentloaded", { timeout: Math.max(1, deadline - Date.now()) });
+  // Unfinished images, videos and analytics must not hold up a DOM analysis.
+  await waitForAnalysisDom(page);
   await waitForAutomaticLogin(page, url, timeout);
 }
 
@@ -3350,6 +3370,43 @@ async function getLinks(page) {
   });
 }
 
+async function checkHttpLinkStatus(link, options = {}, timeoutMs = 10000) {
+  if (options.job?.cancelled) return null;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  if (options.job) options.job.currentController = controller;
+  try {
+    const request = (method) => fetch(link.href, {
+      method, redirect: "follow", signal: controller.signal,
+      headers: browserLikeHeaders({ Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" }),
+    });
+    let response = await request("HEAD");
+    let method = "HEAD";
+    await response.body?.cancel().catch(() => {});
+    if ([400, 403, 405, 501].includes(response.status)) {
+      response = await request("GET");
+      method = "GET";
+      await response.body?.cancel().catch(() => {});
+    }
+    const reason = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`;
+    return {
+      ...link, status: response.status, statusText: response.statusText || "", method,
+      finalUrl: response.url || link.href,
+      ignored: shouldIgnoreHttpStatus(response.status, options),
+      uncertain: response.status === 400,
+      reason: response.status === 400
+        ? `${reason}. Serveren avviste den automatiske forespørselen. Dette bekrefter ikke at lenken er brutt; kontroller den i nettleseren.`
+        : reason,
+    };
+  } catch (error) {
+    if (options.job?.cancelled) return null;
+    return { ...link, status: 0, reason: error.name === "AbortError" ? "Tidsavbrudd" : "Kunne ikke nå lenken" };
+  } finally {
+    clearTimeout(timeout);
+    if (options.job?.currentController === controller) options.job.currentController = null;
+  }
+}
+
 async function getBrokenLinks(page, pageUrl, options = {}) {
   const linkResult = await getLinks(page);
   const links = linkResult.links || [];
@@ -3368,6 +3425,7 @@ async function getBrokenLinks(page, pageUrl, options = {}) {
   const uniqueLinks = new Map();
   const checked = [];
   const broken = [];
+  const uncertain = [];
   const skipped = [];
 
   links.forEach((link) => {
@@ -3377,50 +3435,12 @@ async function getBrokenLinks(page, pageUrl, options = {}) {
   });
 
   async function checkHttpLink(link) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000);
-
-    try {
-      let response = await fetch(link.href, {
-        method: "HEAD",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: browserLikeHeaders({
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }),
-      });
-
-      if (response.status === 405 || response.status === 403) {
-        response = await fetch(link.href, {
-          method: "GET",
-          redirect: "follow",
-          signal: controller.signal,
-          headers: browserLikeHeaders({
-            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          }),
-        });
-      }
-
-      checked.push({
-        ...link,
-        status: response.status,
-        statusText: response.statusText || "",
-      });
-
-      if (response.status >= 400 && !shouldIgnoreHttpStatus(response.status, options)) {
-        broken.push({
-          ...link,
-          reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
-        });
-      }
-    } catch (error) {
-      broken.push({
-        ...link,
-        reason: error.name === "AbortError" ? "Tidsavbrudd" : "Kunne ikke nå lenken",
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
+    const result = await checkHttpLinkStatus(link, options);
+    if (!result) return;
+    if (result.status) checked.push(result);
+    if (result.ignored) return;
+    if (result.uncertain) uncertain.push(result);
+    else if (!result.status || result.status >= 400) broken.push(result);
   }
 
   async function checkLink(link) {
@@ -3500,6 +3520,7 @@ async function getBrokenLinks(page, pageUrl, options = {}) {
     skippedCount: skipped.length,
     totalCount: uniqueLinks.size,
     broken,
+    uncertain,
     skipped,
   };
 }
@@ -7627,62 +7648,9 @@ function extractLinksForBrokenCheck(html, baseUrl) {
 }
 
 async function checkCrawlHttpLink(link, options = {}) {
-  if (options.job?.cancelled) {
-    return null;
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-
-  if (options.job) {
-    options.job.currentController = controller;
-  }
-
-  try {
-    let response = await fetch(link.href, {
-      method: "HEAD",
-      redirect: "follow",
-      signal: controller.signal,
-      headers: browserLikeHeaders({
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      }),
-    });
-
-    if ([403, 405, 501].includes(response.status)) {
-      response = await fetch(link.href, {
-        method: "GET",
-        redirect: "follow",
-        signal: controller.signal,
-        headers: browserLikeHeaders({
-          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }),
-      });
-    }
-
-    if (response.status >= 400 && !shouldIgnoreHttpStatus(response.status, options)) {
-      return {
-        ...link,
-        reason: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ""}`,
-      };
-    }
-
-    return null;
-  } catch (error) {
-    if (options.job?.cancelled) {
-      return null;
-    }
-
-    return {
-      ...link,
-      reason: error.name === "AbortError" ? "Tidsavbrudd" : "Kunne ikke nå lenken",
-    };
-  } finally {
-    clearTimeout(timeout);
-
-    if (options.job?.currentController === controller) {
-      options.job.currentController = null;
-    }
-  }
+  const result = await checkHttpLinkStatus(link, options, 8000);
+  if (!result || result.ignored || (result.status > 0 && result.status < 400)) return null;
+  return result;
 }
 
 async function extractBrokenLinksFromHtml(html, pageUrl, options = {}) {
