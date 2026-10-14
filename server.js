@@ -592,7 +592,11 @@ function httpStatusText(status, statusText = "") {
 }
 
 function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden.") {
-  const message = String(error?.message || error || "");
+  const details = [];
+  for (let cause = error, depth = 0; cause && depth < 5; cause = cause.cause, depth++) {
+    details.push(String(cause.message || cause), String(cause.code || ""));
+  }
+  const message = details.join(" ");
   const name = String(error?.name || "");
 
   if (/URL-en/i.test(message)) {
@@ -615,12 +619,16 @@ function friendlyErrorMessage(error, fallback = "Jeg fikk ikke analysert siden."
     return "URL-en kan ikke nås. Tilkoblingen ble brutt.";
   }
 
-  if (/ERR_CERT|certificate|SSL|TLS/i.test(message)) {
+  if (/ERR_CERT|certificate|SSL|TLS|CERT_|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(message)) {
     return "URL-en kan ikke nås på grunn av sertifikatfeil.";
   }
 
   if (/ERR_TOO_MANY_REDIRECTS|redirect/i.test(message)) {
     return "URL-en kan ikke nås. Siden videresender for mange ganger.";
+  }
+
+  if (/fetch failed|UND_ERR_SOCKET|EPIPE|ERR_CONNECTION_CLOSED/i.test(message)) {
+    return "WebQuest-serveren fikk ikke opprettet en forbindelse til nettstedet. Siden kan likevel fungere i nettleseren din.";
   }
 
   return fallback;
@@ -662,6 +670,9 @@ async function checkReachableUrl(url) {
           }),
         });
       }
+
+      // Only headers are needed. Release an unused GET body before a browser attempt.
+      await response.body?.cancel().catch(() => {});
 
       if (response.status >= 500 && attempt < 2) {
         await new Promise((resolve) => setTimeout(resolve, 350 * attempt));
@@ -722,13 +733,21 @@ async function checkReachableUrl(url) {
     }
   }
 
-  return {
-    ok: false,
-    url: validatedUrl,
-    error: friendlyErrorMessage(lastError, "URL-en kan ikke nås."),
-  };
+  // Node's HTTP/TLS client and Chromium can receive different results.
+  // A failed fetch is not evidence that a normal browser cannot open the page.
+  try {
+    return await checkReachableUrlWithBrowser(validatedUrl);
+  } catch (error) {
+    const browserMessage = friendlyErrorMessage(error, "");
+    return {
+      ok: false,
+      url: validatedUrl,
+      error: browserMessage || friendlyErrorMessage(lastError, "WebQuest-serveren fikk ikke kontrollert adressen. Prøv igjen om litt."),
+    };
+  }
 }
 
+/* URL reachability uses a short-lived context, never the user's analysis session. */
 async function checkReachableUrlWithBrowser(url) {
   const browser = await getBrowser();
   const context = await browser.newContext(browserContextOptions());
@@ -737,7 +756,7 @@ async function checkReachableUrlWithBrowser(url) {
   try {
     page = await context.newPage();
     const response = await page.goto(url, {
-      waitUntil: "domcontentloaded",
+      waitUntil: "commit",
       timeout: 20000,
     });
     const status = response?.status() || 0;
