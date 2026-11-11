@@ -7,7 +7,7 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "axe-core": "^4.10.3",
+    "axe-core": "4.12.1",
     "css-tree": "^3.2.1",
     "dictionary-en": "^4.0.0",
     "dictionary-nb": "^3.0.0",

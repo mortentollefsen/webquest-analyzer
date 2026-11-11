@@ -1,4 +1,5 @@
 import express from "express";
+import { runContrastReport, runContrastProbe } from "./src/contrast-report.mjs";
 import { retryHttpLinkWithGet, classifyHttpLinkResponse } from "./src/link-status.mjs";
 import { readFileSync } from "node:fs";
 const collectHeadingReport = new Function(readFileSync(new URL("./src/heading-analysis.js", import.meta.url), "utf8") + "\nreturn webquestHeadingAnalysis.headingsReport();");
@@ -3069,194 +3070,57 @@ async function getFields(page) {
   });
 }
 
-async function getContrast(page) {
-  return page.evaluate(() => {
-    const failuresAA = [];
-    const failuresAAA = [];
-    const seen = new Set();
-    let checked = 0;
-
-    function normalized(text) {
-      return String(text || "").replace(/\s+/g, " ").trim();
-    }
-
-    function parseColor(color) {
-      const match = String(color).match(/rgba?\(([^)]+)\)/i);
-
-      if (!match) {
-        return null;
+async function getContrast(page, modes = []) {
+  await page.evaluate(axe.source);
+  const report = await page.evaluate(runContrastReport);
+  const probe = (action, input) => page.evaluate(runContrastProbe, { action, input });
+  const unavailable = (note) => ({ items: [], note });
+  if (modes.includes("-bakgrunn")) {
+    try {
+      const prepared = await probe("prepare", report);
+      if (!prepared.token) report.backgroundProbe = prepared;
+      else {
+        let png, unchanged;
+        try {
+          png = await page.screenshot({ timeout: 4000 });
+        } finally {
+          unchanged = await probe("finish", prepared.token).catch(() => false);
+        }
+        report.backgroundProbe = unchanged
+          ? await probe("pixels", { png: png.toString("base64"), probe: prepared })
+          : unavailable("Siden endret seg under målingen. Ingen skjermbildeverdier rapporteres.");
       }
-
-      const parts = match[1].split(",").map((part) => part.trim());
-      const rgb = parts.slice(0, 3).map(Number);
-      const alpha = parts.length > 3 ? Number(parts[3]) : 1;
-
-      if (rgb.some((value) => Number.isNaN(value)) || Number.isNaN(alpha)) {
-        return null;
-      }
-
-      return { r: rgb[0], g: rgb[1], b: rgb[2], a: alpha };
+    } catch {
+      report.backgroundProbe = unavailable("Skjermbildemålingen kunne ikke gjennomføres.");
     }
-
-    function blend(foreground, background) {
-      const alpha = foreground.a + background.a * (1 - foreground.a);
-
-      if (alpha === 0) {
-        return { r: 255, g: 255, b: 255, a: 1 };
-      }
-
-      return {
-        r: (foreground.r * foreground.a + background.r * background.a * (1 - foreground.a)) / alpha,
-        g: (foreground.g * foreground.a + background.g * background.a * (1 - foreground.a)) / alpha,
-        b: (foreground.b * foreground.a + background.b * background.a * (1 - foreground.a)) / alpha,
-        a: alpha,
-      };
-    }
-
-    function relativeLuminance(color) {
-      const values = [color.r, color.g, color.b].map((channel) => {
-        const value = channel / 255;
-        return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
-      });
-
-      return 0.2126 * values[0] + 0.7152 * values[1] + 0.0722 * values[2];
-    }
-
-    function contrastRatio(foreground, background) {
-      const first = relativeLuminance(foreground);
-      const second = relativeLuminance(background);
-      const lighter = Math.max(first, second);
-      const darker = Math.min(first, second);
-
-      return (lighter + 0.05) / (darker + 0.05);
-    }
-
-    function effectiveBackground(element) {
-      let background = { r: 255, g: 255, b: 255, a: 1 };
-      const colors = [];
-
-      for (let node = element; node; node = node.parentElement) {
-        const color = parseColor(window.getComputedStyle(node).backgroundColor);
-
-        if (color && color.a > 0) {
-          colors.push(color);
+  }
+  if (modes.includes("-fokus")) {
+    report.focusProbe = await probe("focus").catch(() => unavailable("Fokusmålingen kunne ikke gjennomføres."));
+  }
+  if (modes.includes("-hover")) {
+    try {
+      const candidates = await probe("targets");
+      const items = [];
+      for (const target of candidates.items) {
+        try {
+          await page.mouse.move(0, 0);
+          const before = await probe("snapshot", target.where);
+          await page.locator(target.where).hover({ timeout: 500 });
+          await page.waitForTimeout(120);
+          const after = await probe("snapshot", target.where);
+          items.push(await probe("compare", { target, before, after, mode: "hover" }));
+        } catch {
+          items.push({ ...target, note: "Hover kunne ikke måles for denne kontrollen." });
         }
       }
-
-      colors.reverse().forEach((color) => {
-        background = blend(color, background);
-      });
-
-      return background;
+      report.hoverProbe = { total: candidates.total, items };
+    } catch {
+      report.hoverProbe = unavailable("Hovermålingen kunne ikke gjennomføres.");
+    } finally {
+      await page.mouse.move(0, 0).catch(() => {});
     }
-
-    function isHidden(element) {
-      for (let node = element; node; node = node.parentElement) {
-        const style = window.getComputedStyle(node);
-
-        if (
-          node.hasAttribute("hidden") ||
-          style.display === "none" ||
-          style.visibility === "hidden" ||
-          style.visibility === "collapse" ||
-          style.opacity === "0" ||
-          style.contentVisibility === "hidden"
-        ) {
-          return true;
-        }
-      }
-
-      return false;
-    }
-
-    function isLargeText(style) {
-      const fontSize = Number.parseFloat(style.fontSize);
-      const fontWeight = Number.parseInt(style.fontWeight, 10);
-      const isBold = fontWeight >= 700 || style.fontWeight === "bold";
-
-      return fontSize >= 24 || (isBold && fontSize >= 18.66);
-    }
-
-    function selectorFor(element) {
-      if (element.id) {
-        return `#${CSS.escape(element.id)}`;
-      }
-
-      const parts = [];
-
-      for (let node = element; node && node.nodeType === Node.ELEMENT_NODE && parts.length < 5; node = node.parentElement) {
-        const tag = node.tagName.toLowerCase();
-        const parent = node.parentElement;
-
-        if (!parent) {
-          parts.unshift(tag);
-          break;
-        }
-
-        const sameTag = Array.from(parent.children).filter((child) => child.tagName === node.tagName);
-        const index = sameTag.indexOf(node) + 1;
-        parts.unshift(sameTag.length > 1 ? `${tag}:nth-of-type(${index})` : tag);
-      }
-
-      return parts.join(" > ");
-    }
-
-    function addFailure(collection, data) {
-      const key = `${data.selector}|${data.text}|${data.required}`;
-
-      if (!seen.has(key)) {
-        seen.add(key);
-        collection.push(data);
-      }
-    }
-
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-
-    while (walker.nextNode()) {
-      const textNode = walker.currentNode;
-      const text = normalized(textNode.nodeValue);
-      const element = textNode.parentElement;
-
-      if (!text || !element || isHidden(element)) {
-        continue;
-      }
-
-      const style = window.getComputedStyle(element);
-      const foreground = parseColor(style.color);
-
-      if (!foreground || foreground.a === 0) {
-        continue;
-      }
-
-      checked += 1;
-
-      const background = effectiveBackground(element);
-      const ratio = contrastRatio(blend(foreground, background), background);
-      const large = isLargeText(style);
-      const aaRequired = large ? 3 : 4.5;
-      const aaaRequired = large ? 4.5 : 7;
-      const common = {
-        text: text.length > 120 ? `${text.slice(0, 117)}...` : text,
-        selector: selectorFor(element),
-        ratio: Math.round(ratio * 100) / 100,
-        largeText: large,
-      };
-
-      if (ratio < aaRequired) {
-        addFailure(failuresAA, { ...common, required: aaRequired });
-      }
-
-      if (ratio < aaaRequired) {
-        addFailure(failuresAAA, { ...common, required: aaaRequired });
-      }
-    }
-
-    return {
-      checked,
-      aaFailures: failuresAA,
-      aaaFailures: failuresAAA,
-    };
-  });
+  }
+  return report;
 }
 
 async function getLinks(page) {
@@ -6899,14 +6763,14 @@ async function getSummary(page, url, options = {}) {
   const images = await getImages(page);
   const hiddenCookieBanners = await countHiddenCookieOverlays(page).catch(() => 0);
   const aria = await getAriaIssues(page);
-  const contrast = await getSummaryPart("Kontrast", () => getContrast(page), {
-    aaFailures: [],
-  }, 10000);
   const wcag = await getSummaryPart("WCAG", () => getWcag(page), {
     summary: { violations: 0, incomplete: 0, passes: 0 },
     groups: {},
     incomplete: [],
   }, 15000);
+  const contrast = wcag.error
+    ? await getSummaryPart("Kontrast", () => getContrast(page), { levels: [] }, 10000)
+    : null;
   const html = await getSummaryPart("HTML-validering", () => getHtmlValidation(url), {
     valid: false,
     errorCount: 0,
@@ -6927,7 +6791,9 @@ async function getSummary(page, url, options = {}) {
   const imagesMissingAlt = images.filter((image) => image.altStatus === "mangler alt").length;
   const wcagViolations = Number(wcag.summary?.violations) || 0;
   const wcagNodes = countWcagNodes(wcag);
-  const contrastFailures = (contrast.aaFailures || []).length;
+  const contrastFailures = contrast
+    ? contrast.levels?.find((level) => level.level === "AA")?.groups.find((group) => group.kind === "violations")?.count || 0
+    : wcag.groups?.AA?.find((rule) => rule.id === "color-contrast")?.count || 0;
   const htmlErrors = Number(html.errorCount) || 0;
   const landmarkIssues = (landmarks.issues || []).length + (landmarks.outsideItems || []).length;
   const priorities = [];
@@ -6980,7 +6846,7 @@ async function getSummary(page, url, options = {}) {
       htmlWarnings: Number(html.warningCount) || 0,
       htmlError: html.error || "",
       contrastAA: contrastFailures,
-      contrastError: contrast.error || "",
+      contrastError: contrast?.error || "",
       fieldsMissingNames: fieldMissingNames,
       links: (links.issues || []).length,
       linksMissingNames: linkMissingNames,
@@ -8641,11 +8507,11 @@ const analyzers = {
     url,
     groups: await getFields(page),
   }),
-  contrast: async (page, url) => ({
+  contrast: async (page, url, options = {}) => ({
     ok: true,
-    engine: "playwright",
+    engine: "axe-core",
     url,
-    contrast: await getContrast(page),
+    contrast: await getContrast(page, options.contrastModes),
   }),
   css: async (page, url) => ({
     ok: true,
@@ -9413,7 +9279,10 @@ app.get("/analyze", async (req, res) => {
 
     const result = await analyzePage(
       url,
-      (page) => analyzers[command](page, url, { selector, language, ignore401, ignore403 }),
+      (page) => analyzers[command](page, url, {
+        selector, language, ignore401, ignore403,
+        contrastModes: String(req.query.contrastModes || "").split(",").filter((mode) => ["-fokus", "-bakgrunn", "-hover"].includes(mode)),
+      }),
       { cookieChoice, cookieFlow, viewport, clientWindowId, forceFreshContext: command === "cookies" }
     );
 
